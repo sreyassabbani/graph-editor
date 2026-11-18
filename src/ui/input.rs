@@ -80,7 +80,31 @@ impl App {
         (!self.graph.vertices.iter().any(|v| v.x == g.0 && v.y == g.1)).then_some(g)
     }
     fn update_hover(&mut self, p: Option<(f64, f64)>) {
-        self.hover = p.and_then(|p| self.placement(p));
+        self.hover = p.and_then(|p| match self.drag {
+            Some(Drag::Vertices { moved: true, .. }) => self.landing(p),
+            _ => self.placement(p),
+        });
+    }
+    /// While dragging vertices: the grid point the grabbed vertex snaps to on
+    /// release, or None when that drop would overlap another vertex.
+    fn landing(&self, p: (f64, f64)) -> Option<(f64, f64)> {
+        let Some(Drag::Vertices {
+            anchor,
+            ids,
+            original,
+            offset,
+            ..
+        }) = &self.drag
+        else {
+            return None;
+        };
+        let q = self.world(p);
+        let before = original.vertex(*anchor)?;
+        let target = ((q.0 + offset.0).round(), (q.1 + offset.1).round());
+        original
+            .clone()
+            .translate(ids, target.0 - before.x, target.1 - before.y)
+            .then_some(target)
     }
     pub(super) fn mouse(&mut self, m: MouseEvent) {
         if self.editing.is_some() {
@@ -234,14 +258,10 @@ impl App {
                 // never jumps to the center of a text cell.
                 if *moved || dx.hypot(dy) * self.camera.zoom > 4. {
                     *moved = true;
-                    // Preview the snapped drop position: what you see is where
-                    // it lands, and a new frame is needed only per grid step.
-                    let (sx, sy) = (
-                        (q.0 + offset.0).round() - before.x,
-                        (q.1 + offset.1).round() - before.y,
-                    );
+                    // The vertices follow the pointer exactly; the hover marker
+                    // shows where the grabbed vertex lands (see `landing`).
                     let mut preview = original.clone();
-                    if preview.translate(ids, sx, sy) && preview != self.graph {
+                    if preview.translate(ids, dx, dy) && preview != self.graph {
                         self.graph = preview;
                     }
                     self.edge_start = None;
@@ -879,17 +899,23 @@ mod tests {
         assert_eq!(app.graph.edges.len(), 1); // no duplicate connections
     }
     #[test]
-    fn drag_preview_snaps_to_grid_points_and_collision_rolls_back() {
+    fn drag_follows_pointer_marks_landing_and_collision_rolls_back() {
         let mut app = app();
         app.graph.add_vertex(2., 0.);
         let original = app.graph.clone();
-        // One world unit is 6 columns: a third of a unit stays put, two
-        // thirds previews the next grid point.
+        // One world unit is 6 columns. The vertex follows the pointer; the
+        // hover marker shows the grid point it would land on.
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 40, 12);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 42, 12);
-        assert_eq!(app.graph.vertices[0].x, 0.);
+        assert!((app.graph.vertices[0].x - 1. / 3.).abs() < 1e-9);
+        assert_eq!(app.hover, Some((0., 0.)));
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 44, 12);
-        assert_eq!(app.graph.vertices[0].x, 1.);
+        assert!((app.graph.vertices[0].x - 2. / 3.).abs() < 1e-9);
+        assert_eq!(app.hover, Some((1., 0.)));
+        // Over the other vertex's grid point the drop is invalid: no marker.
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 52, 12);
+        assert_eq!(app.hover, None);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 44, 12);
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 42, 12);
         assert_eq!(app.graph, original); // snaps back without an undo entry
         assert!(!app.history.undo(&mut app.graph));
