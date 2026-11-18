@@ -107,6 +107,8 @@ mod tests {
                 upload: id.to_string(),
                 camera: job.scene.state.camera,
                 margin: (0, 0),
+                omits: Vec::new(),
+                hides: None,
             }))
         });
         let app = super::super::test_support::app();
@@ -161,6 +163,11 @@ fn render(job: &Job) -> Result<Frame> {
             upload: graphics::encode_frame(pix, transport, graphics::is_tmux())?,
             camera: job.scene.state.camera,
             margin: job.scene.margin,
+            omits: match &job.scene.state.layer {
+                Layer::Still(ids) => ids.clone(),
+                _ => Vec::new(),
+            },
+            hides: job.scene.state.hide_edge,
         }))
     } else {
         let (width, height) = (pix.width(), pix.height());

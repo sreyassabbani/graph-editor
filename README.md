@@ -17,18 +17,24 @@ Sixel terminals use a slower fallback. Copy uses `pbcopy`, so it works on macOS 
 
 | Do | How |
 | --- | --- |
-| Add a vertex | Click empty canvas |
-| Connect two vertices | Click one, then the other (Esc cancels) |
-| Select | Drag a box, or Ctrl/Cmd-click to toggle; `a` selects all |
-| Move | Drag a vertex (the whole selection moves); arrow keys nudge |
-| Change style | Double-click a vertex, or `s`: dot → circle → plain |
-| Label | Enter, or the Label button; an empty label removes it |
+| Draw | Click empty canvas to add a vertex. The ringed vertex is the pen: each click on empty canvas adds a vertex joined to it, and each click on a vertex joins that one; the pen moves along |
+| Branch | Lift the pen, click the vertex to branch from, then keep clicking (a click on a vertex with the pen down joins it) |
+| Lift the pen | Esc, right-click, or click the ringed vertex |
+| Select | Click a vertex, its label or an edge; drag a box; Ctrl-click toggles; `a` selects all |
+| Move | Drag a vertex; a selection moves together when you drag any of its vertices, a selected edge, or inside its dashed box; arrow keys nudge |
+| Deselect | Click inside the selection's dashed box, or Esc |
+| Label | Double-click a vertex, Enter, or the Label button; an empty label removes it |
+| Change style | `s` or the Style button: dot → circle → plain |
 | Renumber 1…n | `R` |
 | Delete | Backspace |
 | Pan / zoom | Scroll or right-drag / Ctrl-scroll, `+` `-`, `F` fits |
 | Undo / redo | `u` / `U` (or ⌘Z / ⌘⇧Z) |
 | Copy as Typst | Copy button or Ctrl-C |
 | Quit | `q` (asks again if you haven't copied) |
+
+Ctrl-click is the toggle that works everywhere: terminals don't report Cmd,
+and Ghostty keeps Shift-click for its own text selection unless
+`mouse-shift-capture` is set.
 
 Each launch starts with an empty canvas, and nothing is saved.
 

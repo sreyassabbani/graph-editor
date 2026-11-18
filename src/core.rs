@@ -287,20 +287,63 @@ impl Camera {
 pub struct History {
     undo: Vec<Graph>,
     redo: Vec<Graph>,
+    /// Bumped by every change to the stacks, so a caller can tell whether
+    /// the last checkpoint is still its own (see [`History::discard`]).
+    generation: u64,
+    /// What the last checkpoint pushed out: the Redo it cleared and the
+    /// oldest step it evicted at the cap, so discarding it loses nothing.
+    displaced: (Vec<Graph>, Option<Graph>),
 }
 
 impl History {
     pub fn checkpoint(&mut self, graph: &Graph) {
-        Self::push_bounded(&mut self.undo, graph.clone());
-        self.redo.clear();
+        let evicted = Self::push_bounded(&mut self.undo, graph.clone());
+        self.displaced = (std::mem::take(&mut self.redo), evicted);
+        self.generation += 1;
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
+    }
+    /// The nearest state with any vertices on each side: in Undo, and in
+    /// Redo.
+    pub fn nearest_drawings(&self) -> [Option<&Graph>; 2] {
+        fn near(stack: &[Graph]) -> Option<&Graph> {
+            stack.iter().rev().find(|g| !g.vertices.is_empty())
+        }
+        [near(&self.undo), near(&self.redo)]
+    }
+    /// Take back the checkpoint made at `generation` as if it never
+    /// happened: `graph` returns to the state before it, and the Redo and
+    /// oldest step it displaced come back. False (and nothing changes) if
+    /// anything was recorded since.
+    pub fn discard(&mut self, graph: &mut Graph, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        let Some(previous) = self.undo.pop() else {
+            return false;
+        };
+        *graph = previous;
+        let (redo, evicted) = std::mem::take(&mut self.displaced);
+        self.redo = redo;
+        if let Some(oldest) = evicted {
+            self.undo.insert(0, oldest);
+        }
+        self.generation += 1;
+        true
+    }
+    #[cfg(test)]
+    pub fn depth(&self) -> usize {
+        self.undo.len()
     }
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
     pub fn undo(&mut self, graph: &mut Graph) -> bool {
+        self.generation += 1;
         if let Some(previous) = self.undo.pop() {
             Self::push_bounded(&mut self.redo, std::mem::replace(graph, previous));
             true
@@ -309,6 +352,7 @@ impl History {
         }
     }
     pub fn redo(&mut self, graph: &mut Graph) -> bool {
+        self.generation += 1;
         if let Some(next) = self.redo.pop() {
             Self::push_bounded(&mut self.undo, std::mem::replace(graph, next));
             true
@@ -316,11 +360,11 @@ impl History {
             false
         }
     }
-    fn push_bounded(stack: &mut Vec<Graph>, graph: Graph) {
-        if stack.len() == 100 {
-            stack.remove(0);
-        }
+    /// Push, dropping (and returning) the oldest entry at the cap.
+    fn push_bounded(stack: &mut Vec<Graph>, graph: Graph) -> Option<Graph> {
+        let evicted = (stack.len() == 100).then(|| stack.remove(0));
         stack.push(graph);
+        evicted
     }
 }
 

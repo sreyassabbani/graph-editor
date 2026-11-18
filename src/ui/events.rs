@@ -2,6 +2,7 @@ use super::*;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
+const BUSY_POLL: Duration = Duration::from_millis(1);
 
 // Only adjacent motion samples are replaceable. Never drop a press, release,
 // scroll, or key: those are gesture boundaries and ordered edits.
@@ -26,6 +27,7 @@ impl App {
         loop {
             self.dirty |= self.renderer.ready();
             self.dirty |= self.expire_status();
+            self.dirty |= self.animate();
             if self.dirty && last_frame.elapsed() >= FRAME_INTERVAL {
                 // Measure start-to-start; expensive work must not add another
                 // fixed frame interval after it finishes.
@@ -48,11 +50,19 @@ impl App {
             let wait = if self.dirty {
                 Some(FRAME_INTERVAL.saturating_sub(last_frame.elapsed()))
             } else if self.renderer.busy() {
-                Some(FRAME_INTERVAL)
+                // The worker cannot wake the input wait, so check for its
+                // frame often; waiting a whole frame interval here delayed
+                // every click's result by up to 8 ms.
+                Some(BUSY_POLL)
             } else {
                 // Wake to clear an operation result.
                 self.status_at
                     .map(|at| STATUS_TTL.saturating_sub(at.elapsed()))
+            };
+            // Wake for the next animation step too.
+            let wait = match (wait, self.animation_wait()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
             };
             if let Some(wait) = wait {
                 if !event::poll(wait)? {
@@ -92,6 +102,7 @@ impl App {
         // Pure pointer motion cannot change graph geometry or the camera.
         // Keep its hot path independent of graph size and snapshot allocation.
         let hover_only = matches!(&event, Event::Mouse(m) if m.kind == MouseEventKind::Moved);
+        self.last_input = Instant::now();
         match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 if self.key(k.code, k.modifiers) {
@@ -99,9 +110,11 @@ impl App {
                 }
             }
             Event::Mouse(m) => {
-                let previous = (self.hover, self.toolbar_hover);
+                let previous = (self.hover, self.hover_edge, self.toolbar_hover);
                 self.mouse(m);
-                if m.kind == MouseEventKind::Moved && previous == (self.hover, self.toolbar_hover) {
+                if m.kind == MouseEventKind::Moved
+                    && previous == (self.hover, self.hover_edge, self.toolbar_hover)
+                {
                     return false;
                 }
             }

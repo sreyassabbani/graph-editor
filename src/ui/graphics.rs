@@ -5,6 +5,8 @@ use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ratatui::layout::Rect;
 use resvg::tiny_skia::Pixmap;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 
 fn image_id() -> u32 {
@@ -35,9 +37,109 @@ pub(super) fn cleanup() -> String {
                 .iter()
                 .map(|id| format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\"))
                 .collect::<String>()
+                + &[0, 1, 2]
+                    .map(|set| {
+                        let (first, last) = tile_ids(set);
+                        format!("\x1b_Ga=d,d=R,x={first},y={last},q=2\x1b\\")
+                    })
+                    .concat()
         ),
         is_tmux(),
     )
+}
+
+/// Side of a dragged-layer tile in device pixels. Small tiles hug edges
+/// tightly, so a moved diagonal edge resends a thin strip of pixels.
+pub(super) const TILE: u32 = 64;
+
+/// The first and last tile id of this process for tile set `set`: dragged
+/// layer (0), decorations (1) or the pen (2). One image per tile position.
+fn tile_ids(set: u32) -> (u32, u32) {
+    let base = (0x5000_0000 + set * 0x1000_0000) | ((std::process::id() & 0xff) << 20);
+    (base, base + 0x000f_ffff)
+}
+
+/// Tiles of one layer now shown, by (column, row), with a hash of their
+/// pixels, and the area and cell size they were placed for.
+#[derive(Default)]
+struct TileSet {
+    set: u32,
+    /// Stacking order: decorations over the frame, the pen behind it.
+    z: i32,
+    shown: HashMap<(u32, u32), u64>,
+    placed_for: Option<(Rect, (u16, u16))>,
+}
+
+impl TileSet {
+    fn id(&self, (col, row): (u32, u32)) -> u32 {
+        tile_ids(self.set).0 + (row << 12) + col
+    }
+    /// Show `layer` (pixels and their canvas origin, both aligned to
+    /// [`TILE`]). Only tiles whose pixels changed are sent; empty ones are
+    /// removed. `None` removes every tile.
+    fn stage(
+        &mut self,
+        pending: &mut String,
+        layer: Option<(Pixmap, (u32, u32))>,
+        area: Rect,
+        cell: (u16, u16),
+    ) {
+        if self.placed_for != Some((area, cell)) {
+            self.clear(pending);
+            self.placed_for = Some((area, cell));
+        }
+        let mut shown = HashMap::new();
+        if let Some((pix, origin)) = layer {
+            let (width, height) = (pix.width(), pix.height());
+            let data = pix.data();
+            for top in (0..height).step_by(TILE as usize) {
+                for left in (0..width).step_by(TILE as usize) {
+                    let (w, h) = (TILE.min(width - left), TILE.min(height - top));
+                    let mut tile = Vec::with_capacity((w * h * 4) as usize);
+                    for y in top..top + h {
+                        let start = ((y * width + left) * 4) as usize;
+                        tile.extend_from_slice(&data[start..start + (w * 4) as usize]);
+                    }
+                    if tile.iter().skip(3).step_by(4).all(|alpha| *alpha == 0) {
+                        continue;
+                    }
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    tile.hash(&mut hasher);
+                    let hash = hasher.finish();
+                    let (x, y) = (origin.0 + left, origin.1 + top);
+                    let key = (x / TILE, y / TILE);
+                    // Ids hold 12 bits of column and 8 of row (a canvas of
+                    // 262144 x 16384 px); never spill into another range.
+                    if key.0 >= 1 << 12 || key.1 >= 1 << 8 {
+                        continue;
+                    }
+                    shown.insert(key, hash);
+                    if self.shown.get(&key) == Some(&hash) {
+                        continue;
+                    }
+                    let id = self.id(key);
+                    let size = resvg::tiny_skia::IntSize::from_wh(w, h).expect("non-empty tile");
+                    let pix = Pixmap::from_vec(tile, size).expect("tile pixels");
+                    pending.push_str(&upload_raw(pix, id));
+                    pending.push_str(&place(id, 1, (x, y), (0, 0), (w, h), self.z, area, cell));
+                }
+            }
+        }
+        for key in self.shown.keys().filter(|k| !shown.contains_key(k)) {
+            pending.push_str(&delete(self.id(*key)));
+        }
+        self.shown = shown;
+    }
+    fn clear(&mut self, pending: &mut String) {
+        for key in self.shown.keys() {
+            pending.push_str(&delete(self.id(*key)));
+        }
+        self.shown.clear();
+    }
+    fn forget(&mut self) {
+        self.shown.clear();
+        self.placed_for = None;
+    }
 }
 
 fn hover_id() -> u32 {
@@ -93,6 +195,14 @@ pub(super) struct KittyCanvas {
     /// Canvas size and strip thicknesses of the uploaded marquee sprites.
     marquee_sprites: Option<((u32, u32), (u32, u32))>,
     marquee_placement: Option<(MarqueeRect, Rect, (u16, u16))>,
+    /// Vertices the shown frame leaves out (dragged or relabeled), which the
+    /// moving tiles then draw.
+    frame_omits: Vec<u64>,
+    /// An edge the shown frame leaves out while it is animated in.
+    frame_hides: Option<crate::core::Edge>,
+    tiles: TileSet,
+    decor: TileSet,
+    pen: TileSet,
 }
 
 /// Put a cropped placement of `id` at canvas pixel (x, y): the cursor goes to
@@ -126,6 +236,11 @@ fn place(
             is_tmux(),
         )
     )
+}
+
+/// Delete image `id` with its placements and pixel data.
+fn delete(id: u32) -> String {
+    passthrough(&format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\"), is_tmux())
 }
 
 fn upload_raw(pix: Pixmap, id: u32) -> String {
@@ -168,11 +283,76 @@ impl KittyCanvas {
             marquee_placement: None,
             frame: None,
             view: None,
+            frame_omits: Vec::new(),
+            frame_hides: None,
+            tiles: TileSet {
+                z: -1,
+                ..TileSet::default()
+            },
+            decor: TileSet {
+                set: 1,
+                z: -1,
+                ..TileSet::default()
+            },
+            pen: TileSet {
+                set: 2,
+                z: -3,
+                ..TileSet::default()
+            },
         }
+    }
+    pub(super) fn frame_omits(&self) -> &[u64] {
+        &self.frame_omits
+    }
+    pub(super) fn frame_hides(&self) -> Option<crate::core::Edge> {
+        self.frame_hides
+    }
+    /// The camera the canvas on screen shows: the uploaded frame's, shifted
+    /// by the crop now placed. It differs from the current camera while a
+    /// new zoom is rendering, or a pan has run past the frame's margin.
+    /// `scale` is device pixels per logical pixel.
+    pub(super) fn shown_camera(&self, scale: (f64, f64)) -> Option<crate::core::Camera> {
+        let (rendered, margin) = self.frame?;
+        let (crop, _) = self.view?;
+        let z = rendered.zoom;
+        Some(crate::core::Camera {
+            x: rendered.x + (f64::from(crop.0) - f64::from(margin.0)) / (z * scale.0),
+            y: rendered.y - (f64::from(crop.1) - f64::from(margin.1)) / (z * scale.1),
+            zoom: z,
+        })
+    }
+    /// Show the dragged or relabeled layer (see [`TileSet::stage`]).
+    pub(super) fn stage_tiles(
+        &mut self,
+        layer: Option<(Pixmap, (u32, u32))>,
+        area: Rect,
+        cell: (u16, u16),
+    ) {
+        self.tiles.stage(&mut self.pending, layer, area, cell);
+    }
+    /// Show selection highlights and the pen ring (see [`TileSet::stage`]).
+    pub(super) fn stage_decor(
+        &mut self,
+        layer: Option<(Pixmap, (u32, u32))>,
+        area: Rect,
+        cell: (u16, u16),
+    ) {
+        self.decor.stage(&mut self.pending, layer, area, cell);
+    }
+    /// Show the pen ring and an edge it unrolls into (see [`TileSet::stage`]).
+    pub(super) fn stage_pen(
+        &mut self,
+        layer: Option<(Pixmap, (u32, u32))>,
+        area: Rect,
+        cell: (u16, u16),
+    ) {
+        self.pen.stage(&mut self.pending, layer, area, cell);
     }
     /// Upload a new canvas frame; the next [`Self::stage_view`] places it.
     pub(super) fn stage_frame(&mut self, frame: KittyFrame) {
         self.pending.push_str(&frame.upload);
+        self.frame_omits = frame.omits;
+        self.frame_hides = frame.hides;
         self.frame = Some((frame.camera, frame.margin));
         self.view = None;
     }
@@ -324,6 +504,11 @@ impl KittyCanvas {
     }
     pub(super) fn hide(&mut self) {
         self.pending = cleanup();
+        self.tiles.forget();
+        self.decor.forget();
+        self.pen.forget();
+        self.frame_omits.clear();
+        self.frame_hides = None;
         self.hover_size = None;
         self.hover_placement = None;
         self.marquee_sprites = None;
@@ -402,6 +587,10 @@ pub(super) struct KittyFrame {
     pub upload: String,
     pub camera: crate::core::Camera,
     pub margin: (u32, u32),
+    /// Vertices it leaves out (see `Layer::Still`); empty for a full frame.
+    pub omits: Vec<u64>,
+    /// An edge it leaves out while the pen animates it in.
+    pub hides: Option<crate::core::Edge>,
 }
 
 pub(super) fn encode_frame(pix: Pixmap, transport: Transport, tmux: bool) -> Result<String> {
@@ -567,6 +756,8 @@ mod tests {
             upload: "UPLOAD".into(),
             camera,
             margin: (20, 20),
+            omits: Vec::new(),
+            hides: None,
         });
         canvas.stage_view(camera, scale, area, cell);
         let mut output = Vec::new();
@@ -746,6 +937,38 @@ mod tests {
                 .count(),
             3
         );
+    }
+    #[test]
+    fn dragged_tiles_resend_only_changed_pixels_and_drop_empty_ones() {
+        let mut canvas = KittyCanvas::new();
+        let area = Rect::new(0, 1, 80, 24);
+        let cell = (8, 16);
+        let layer = |dots: &[(u32, u32)]| {
+            let mut pix = Pixmap::new(2 * TILE, TILE).unwrap();
+            for &(x, y) in dots {
+                pix.pixels_mut()[(y * 2 * TILE + x) as usize] =
+                    resvg::tiny_skia::ColorU8::from_rgba(255, 255, 255, 255).premultiply();
+            }
+            Some((pix, (TILE, 0)))
+        };
+        let staged = |canvas: &mut KittyCanvas, layer| {
+            canvas.stage_tiles(layer, area, cell);
+            let mut output = Vec::new();
+            canvas.flush(&mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            (
+                output.matches("a=t,").count(),
+                output.matches("a=d,").count(),
+            )
+        };
+        // Only the tile with pixels is sent; the empty one is skipped.
+        assert_eq!(staged(&mut canvas, layer(&[(3, 3)])), (1, 0));
+        assert_eq!(staged(&mut canvas, layer(&[(3, 3)])), (0, 0));
+        // Pixels moving into the second tile send it; the first is unchanged.
+        assert_eq!(staged(&mut canvas, layer(&[(3, 3), (TILE + 1, 1)])), (1, 0));
+        // Leaving the first tile deletes it.
+        assert_eq!(staged(&mut canvas, layer(&[(TILE + 1, 1)])), (0, 1));
+        assert_eq!(staged(&mut canvas, None), (0, 1));
     }
     #[test]
     fn hover_moves_without_rasterizing_or_uploading_pixels_and_clips_to_canvas() {

@@ -30,6 +30,34 @@ rendered once a pan passes half that margin.
 graph, so moving it sends only a placement command. Other protocols draw
 hover into each frame through the ratatui-image fallback.
 
+**Dragging and typing labels.** On Kitty terminals, once vertices start
+moving (or their label is being typed), the frame is redrawn once without
+them and their edges. That part is drawn into 64 px tiles over it, and each
+pointer move or keystroke resends only the tiles whose pixels changed, so a
+step costs tens of kilobytes instead of a full frame. Releasing (or saving
+the label) renders one full frame, which replaces the tiles.
+
+**Decorations.** On Kitty the frame never shows selection, the pen ring or
+the hovered edge. Selection and the hovered edge are a second tile set (`Layer::Decor`) drawn over it
+on the input thread, so clicks that only select or move the pen send no
+frame at all: one mark is under 1 KB and a millisecond. The tiles cover the
+selection's extent, so select-all on a large graph costs more (tens of
+milliseconds at a few hundred vertices). While a new zoom renders, or a pan
+runs past the frame's margin, the old frame stays up; decor, the hover marker
+and click hit-testing all use the camera of that frame (`shown_camera`), so
+they line up with what is visible.
+
+**The pen.** Its dashed ring is a third tile set (`Layer::Pen`), placed
+behind the frame so labels stay on top. While the pen is down it turns
+steadily (a few small tiles per step, about 40 a second), easing up to speed
+when the pen goes down and keeping it as the pen moves on; after 60 s without
+input it eases to rest and sends nothing more.
+When a click draws an edge, the frame leaves that edge out for 480 ms while
+the pen layer unrolls the ring into it, spinning up as it pays out, and winds
+a new ring onto the far end, coasting to rest. Then the next frame includes
+the edge; until it arrives, the pen layer keeps drawing the edge
+(`KittyFrame::hides`). Other protocols show a still ring and no animation.
+
 **Input.** With SGR-Pixels mouse reporting (mode 1016: Ghostty, Kitty,
 WezTerm, Rex; not through tmux), panning and dragging follow the pointer pixel
 by pixel; elsewhere they move a cell at a time. Scrolling pans 12 px per tick,

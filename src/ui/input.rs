@@ -30,17 +30,30 @@ impl App {
         let (w, h) = self.size();
         self.camera.screen_to_world(p.0, p.1, w, h)
     }
+    /// The vertex whose mark covers `p`: at least 16 px around its center
+    /// (mouse reports are coarse), and the whole drawn circle when zoomed in,
+    /// but never reaching halfway to a neighboring grid point.
     pub(super) fn hit(&self, p: (f64, f64)) -> Option<u64> {
         let (w, h) = self.size();
+        let s = super::canvas::sizes(self.camera.zoom);
         self.graph
             .vertices
             .iter()
             .rev()
             .find(|v| {
+                let drawn = match v.style {
+                    VertexStyle::Circles => s.ring + s.stroke,
+                    _ => s.dot,
+                };
+                let reach = (self.camera.zoom * 0.45).min(16_f64.max(drawn + 3.));
                 let q = self.camera.world_to_screen(v.x, v.y, w, h);
-                (q.0 - p.0).hypot(q.1 - p.1) <= 16_f64.min(self.camera.zoom * 0.45)
+                (q.0 - p.0).hypot(q.1 - p.1) <= reach
             })
             .map(|v| v.id)
+    }
+    /// The vertex a click at `p` is on: its mark, else its label.
+    fn hit_vertex_or_label(&self, p: (f64, f64)) -> Option<u64> {
+        self.hit(p).or_else(|| self.hit_label(p))
     }
     fn hit_edge(&self, p: (f64, f64)) -> Option<Edge> {
         let (w, h) = self.size();
@@ -72,7 +85,10 @@ impl App {
     /// vertex or edge (those clicks select), not on an occupied point, and
     /// not mid-gesture.
     fn placement(&self, p: (f64, f64)) -> Option<(f64, f64)> {
-        if self.drag.is_some() || self.hit(p).is_some() || self.hit_edge(p).is_some() {
+        if self.drag.is_some()
+            || self.hit_vertex_or_label(p).is_some()
+            || self.hit_edge(p).is_some()
+        {
             return None;
         }
         let q = self.world(p);
@@ -84,6 +100,11 @@ impl App {
             Some(Drag::Vertices { moved: true, .. }) => self.landing(p),
             _ => self.placement(p),
         });
+        // The edge a click would select, unless a vertex wins there.
+        self.hover_edge = p
+            .filter(|_| self.drag.is_none())
+            .filter(|&p| self.hit_vertex_or_label(p).is_none())
+            .and_then(|p| self.hit_edge(p));
     }
     /// While dragging vertices: the grid point the grabbed vertex snaps to on
     /// release, or None when that drop would overlap another vertex.
@@ -108,39 +129,53 @@ impl App {
     }
     pub(super) fn mouse(&mut self, m: MouseEvent) {
         if self.editing.is_some() {
-            // Clicking anywhere saves the label, then acts as a normal click.
-            if !matches!(m.kind, MouseEventKind::Down(_)) {
-                return;
+            // Clicking anywhere saves the label and does nothing else: the
+            // header shows no buttons to click, and a stray vertex or edit
+            // under a click meant to dismiss the field would be a surprise.
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.commit_editing(false);
             }
-            self.commit_editing();
+            return;
         }
         if m.kind != MouseEventKind::Moved {
             self.quit_pending = false;
         }
         let (col, row, p) = self.pointer(&m);
         self.toolbar_hover = (row == 0 && p.is_none()).then_some(col);
-        self.update_hover(p);
+        // The marker shows where a click acts: on the canvas on screen.
+        self.on_displayed_camera(|app| app.update_hover(p));
+        // Toolbar buttons act on release over the button they were pressed
+        // on, like any button: sliding off cancels.
         if m.kind == MouseEventKind::Down(MouseButton::Left) && row == 0 {
-            self.toolbar(col, row);
+            self.toolbar_press = self.toolbar_action(col, row);
             return;
+        }
+        if m.kind == MouseEventKind::Up(MouseButton::Left) {
+            if let Some(pressed) = self.toolbar_press.take() {
+                if self.toolbar_action(col, row) == Some(pressed) {
+                    self.toolbar(pressed);
+                }
+                return;
+            }
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Middle | MouseButton::Right) => {
                 if let Some(p) = p {
                     self.drag = Some(Drag::Pan(p.0, p.1));
                     self.edge_start = None;
+                    self.last_click = None;
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(p) = p {
                     self.status.clear();
-                    self.left_down(p, m.modifiers);
+                    self.on_displayed_camera(|app| app.left_down(p, m.modifiers));
                 }
             }
             MouseEventKind::Drag(button) => {
                 if let Some(p) = p {
                     if button == MouseButton::Left {
-                        self.left_drag(p);
+                        self.on_displayed_camera(|app| app.left_drag(p));
                     } else if let Some(Drag::Pan(x, y)) = &mut self.drag {
                         self.camera.x -= (p.0 - *x) / self.camera.zoom;
                         self.camera.y += (p.1 - *y) / self.camera.zoom;
@@ -153,7 +188,7 @@ impl App {
                 // A different button's release must not finish the active gesture.
                 match (&self.drag, button) {
                     (Some(Drag::Vertices { .. } | Drag::Marquee { .. }), MouseButton::Left) => {
-                        self.left_up(p)
+                        self.on_displayed_camera(|app| app.left_up(p))
                     }
                     (Some(Drag::Pan(..)), MouseButton::Middle | MouseButton::Right) => {
                         self.drag = None
@@ -192,7 +227,20 @@ impl App {
             _ => {}
         }
         // Panning, zooming and edits change what lies beneath the pointer.
-        self.update_hover(p);
+        self.on_displayed_camera(|app| app.update_hover(p));
+    }
+    /// Run a canvas click handler against the camera on screen. Right after
+    /// a zoom the old frame stays up until the new one is drawn, and clicks
+    /// act on what is visible. Only hit-testing sees it: the handlers do not
+    /// move the camera, and the real one is restored afterwards.
+    fn on_displayed_camera(&mut self, handle: impl FnOnce(&mut Self)) {
+        let shown = self.displayed_camera();
+        if shown == self.camera {
+            return handle(self);
+        }
+        let camera = std::mem::replace(&mut self.camera, shown);
+        handle(self);
+        self.camera = camera;
     }
     /// Ctrl/Alt/Super (or Shift, where the terminal reports it) toggle
     /// membership instead of replacing the selection.
@@ -203,7 +251,7 @@ impl App {
     }
     fn left_down(&mut self, p: (f64, f64), mods: KeyModifiers) {
         let additive = Self::additive(mods);
-        if let Some(id) = self.hit(p) {
+        if let Some(id) = self.hit_vertex_or_label(p) {
             if additive {
                 self.selection.toggle_vertex(id);
                 self.edge_start = None;
@@ -219,8 +267,9 @@ impl App {
             let v = self.graph.vertex(id).unwrap();
             self.drag = Some(Drag::Vertices {
                 anchor: id,
+                // Whichever handle is grabbed, a selection moves as one set.
                 ids: if narrow {
-                    self.selection.vertices.clone()
+                    self.selection_group()
                 } else {
                     vec![id]
                 },
@@ -228,8 +277,14 @@ impl App {
                 offset: (v.x - q.0, v.y - q.1),
                 moved: false,
                 narrow,
+                grab: Grab::Vertex,
             });
         } else if let Some(edge) = self.hit_edge(p) {
+            // Grabbing a selected edge moves the selection with it.
+            if !additive && self.selection.has_edge(&edge) {
+                self.grab_selection(p, Grab::Edge(edge));
+                return;
+            }
             if additive {
                 self.selection.toggle_edge(edge);
             } else {
@@ -238,6 +293,9 @@ impl App {
             self.edge_start = None;
             self.last_click = None;
             self.drag = None;
+        } else if !additive && self.in_selection_box(p) {
+            // As in other editors, the area of a multi-selection is a handle.
+            self.grab_selection(p, Grab::Empty);
         } else {
             self.drag = Some(Drag::Marquee {
                 start: p,
@@ -245,6 +303,44 @@ impl App {
                 additive,
             });
         }
+    }
+    /// Every vertex a move of the selection carries: its vertices and the
+    /// ends of its edges.
+    fn selection_group(&self) -> Vec<u64> {
+        let mut ids = self.selection.vertices.clone();
+        for e in &self.selection.edges {
+            for id in [e.a, e.b] {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.retain(|&id| self.graph.vertex(id).is_some());
+        ids
+    }
+    /// Start moving the whole selection from a press at `p`.
+    fn grab_selection(&mut self, p: (f64, f64), grab: Grab) {
+        let ids = self.selection_group();
+        let Some(anchor) = ids.first().copied() else {
+            return;
+        };
+        let q = self.world(p);
+        let v = self.graph.vertex(anchor).unwrap();
+        self.drag = Some(Drag::Vertices {
+            anchor,
+            ids,
+            original: self.graph.clone(),
+            offset: (v.x - q.0, v.y - q.1),
+            moved: false,
+            narrow: false,
+            grab,
+        });
+    }
+    /// Whether `p` is inside the box drawn around a multi-selection.
+    fn in_selection_box(&self, p: (f64, f64)) -> bool {
+        let (w, h) = self.size();
+        super::canvas::selection_box(&self.graph, &self.selection, self.camera, w, h)
+            .is_some_and(|(lo, hi)| (lo.0..=hi.0).contains(&p.0) && (lo.1..=hi.1).contains(&p.1))
     }
     fn left_drag(&mut self, p: (f64, f64)) {
         let q = self.world(p);
@@ -286,6 +382,7 @@ impl App {
                 offset,
                 moved,
                 narrow,
+                grab,
             }) => {
                 if moved {
                     let before = original.vertex(anchor).unwrap();
@@ -308,11 +405,32 @@ impl App {
                     if self.graph != original {
                         self.history.checkpoint(&original);
                     }
-                } else if p.and_then(|p| self.hit(p)) == Some(anchor) {
-                    if narrow {
-                        self.selection = Selection::vertex(anchor);
+                } else if let Grab::Edge(edge) = grab {
+                    // Released elsewhere: a cancelled click changes nothing.
+                    if p.and_then(|p| self.hit_edge(p))
+                        .is_some_and(|e| same_edge(&e, &edge))
+                    {
+                        self.selection = Selection::edge(edge);
+                        self.edge_start = None;
+                        self.last_click = None;
                     }
-                    self.click_vertex(anchor);
+                } else if let Grab::Empty = grab {
+                    // A click (no move) in a selection's box deselects, as
+                    // in other editors; placing a vertex there would leave a
+                    // stray one where the user meant to clear the selection.
+                    if p.is_some() {
+                        self.selection = Selection::default();
+                        self.last_click = None;
+                    }
+                } else if p.and_then(|p| self.hit_vertex_or_label(p)) == Some(anchor) {
+                    if narrow {
+                        // Narrowing a multi-selection is selection work; it
+                        // must not also pick up the pen.
+                        self.selection = Selection::vertex(anchor);
+                        self.last_click = Some((anchor, Instant::now(), None));
+                    } else {
+                        self.click_vertex(anchor);
+                    }
                 }
             }
             Some(Drag::Marquee {
@@ -320,16 +438,20 @@ impl App {
                 end,
                 additive,
             }) => {
-                self.edge_start = None;
-                self.last_click = None;
                 if (end.0 - start.0).hypot(end.1 - start.1) < 4. {
-                    // A click on empty canvas places a vertex.
-                    if !additive {
-                        self.selection = Selection::default();
-                        self.add_vertex_at(start);
+                    // A click on empty canvas places a vertex, joined to the
+                    // pen's vertex if it is down. A release off the canvas
+                    // cancels, leaving the pen where it was.
+                    if !additive && p.is_some() {
+                        let pen = self.edge_start.take();
+                        self.last_click = None;
+                        self.click_empty(start, pen);
                     }
                     return;
                 }
+                // A box selection lifts the pen.
+                self.edge_start = None;
+                self.last_click = None;
                 let picked = self.in_rect(start, end);
                 if additive {
                     self.selection.extend(picked);
@@ -340,7 +462,38 @@ impl App {
             other => self.drag = other,
         }
     }
-    fn add_vertex_at(&mut self, p: (f64, f64)) {
+    /// Click on canvas away from any vertex mark or edge. Its grid point may
+    /// still hold a vertex (between the mark and half a grid step): then the
+    /// click is on that vertex. Otherwise a vertex is placed there, joined to
+    /// `pen`'s vertex, and the pen moves to it.
+    fn click_empty(&mut self, p: (f64, f64), pen: Option<u64>) {
+        let q = self.world(p);
+        let g = (q.0.round(), q.1.round());
+        if let Some(id) = self
+            .graph
+            .vertices
+            .iter()
+            .find(|v| v.x == g.0 && v.y == g.1)
+            .map(|v| v.id)
+        {
+            self.edge_start = pen;
+            self.selection = Selection::vertex(id);
+            self.click_vertex(id);
+            return;
+        }
+        // `add_vertex_at` records the undo step; the edge joins that step.
+        let Some(id) = self.add_vertex_at(p) else {
+            return;
+        };
+        if let Some(from) = pen {
+            self.graph.connect(from, id);
+            self.unroll = Some((from, id, Instant::now()));
+        }
+        self.edge_start = Some(id);
+    }
+    /// Place a new vertex on the grid point nearest `p` and select it, as one
+    /// undo step. `None` if the point is taken.
+    fn add_vertex_at(&mut self, p: (f64, f64)) -> Option<u64> {
         let q = self.world(p);
         let (x, y) = (q.0.round(), q.1.round());
         if x.is_finite()
@@ -353,7 +506,9 @@ impl App {
                 .graph
                 .add_styled_vertex(x, y, self.new_style, !self.new_unlabeled);
             self.selection = Selection::vertex(id);
+            return Some(id);
         }
+        None
     }
     /// Vertices inside the screen rectangle, and edges with both ends inside.
     fn in_rect(&self, a: (f64, f64), b: (f64, f64)) -> Selection {
@@ -406,17 +561,24 @@ impl App {
     }
     /// Join every pair of selected vertices (a complete graph on the selection).
     pub(super) fn connect_selection(&mut self) {
-        let ids = self.selection.vertices.clone();
+        let ids: Vec<u64> = self
+            .selection
+            .vertices
+            .iter()
+            .copied()
+            .filter(|&id| self.graph.vertex(id).is_some())
+            .collect();
+        let present: std::collections::HashSet<_> = self
+            .graph
+            .edges
+            .iter()
+            .map(|e| (e.a.min(e.b), e.a.max(e.b)))
+            .collect();
         let mut missing = Vec::new();
         for (i, &a) in ids.iter().enumerate() {
             for &b in &ids[i + 1..] {
-                let present = self
-                    .graph
-                    .edges
-                    .iter()
-                    .any(|e| (e.a == a && e.b == b) || (e.a == b && e.b == a));
-                if !present {
-                    missing.push((a, b));
+                if a != b && !present.contains(&(a.min(b), a.max(b))) {
+                    missing.push(Edge { a, b });
                 }
             }
         }
@@ -424,28 +586,48 @@ impl App {
             return;
         }
         self.history.checkpoint(&self.graph);
-        for (a, b) in missing {
-            self.graph.connect(a, b);
-        }
+        let n = missing.len();
+        self.graph.edges.extend(missing);
+        self.say(match n {
+            1 => "Added 1 edge".to_string(),
+            n => format!("Added {n} edges, joining every selected pair"),
+        });
     }
-    fn click_vertex(&mut self, id: u64) {
-        if self
-            .last_click
-            .is_some_and(|(old, t)| old == id && t.elapsed() < Duration::from_millis(400))
-        {
-            self.cycle_style(id);
-            self.edge_start = None;
-            self.last_click = None;
-        } else {
-            self.last_click = Some((id, Instant::now()));
-            match self.edge_start.take() {
-                Some(start) if start != id => self.connect(start, id),
-                Some(_) => {}
-                None => {
-                    self.edge_start = Some(id);
+    /// A plain click on a vertex. The pen draws from vertex to vertex:
+    /// with it down elsewhere the click joins the two (or, if they are joined
+    /// already, just moves there) and the pen moves on; on this vertex it
+    /// lifts; up, it goes down here. A double-click edits the label.
+    pub(super) fn click_vertex(&mut self, id: u64) {
+        if let Some((old, at, undo)) = self.last_click {
+            if old == id && at.elapsed() < Duration::from_millis(400) {
+                // A double-click is about the label: if its first click drew
+                // an edge from the pen, take that edge back.
+                if let Some(generation) = undo {
+                    self.history.discard(&mut self.graph, generation);
+                    self.unroll = None;
                 }
+                self.edge_start = None;
+                self.last_click = None;
+                self.selection = Selection::vertex(id);
+                self.edit_label();
+                return;
             }
         }
+        let generation = self.history.generation();
+        let pen = self.edge_start;
+        self.edge_start = match pen {
+            Some(start) if start == id => None,
+            Some(start) => {
+                self.connect(start, id);
+                Some(id)
+            }
+            None => Some(id),
+        };
+        let drew = self.history.generation() != generation;
+        if let (true, Some(start)) = (drew, pen) {
+            self.unroll = Some((start, id, Instant::now()));
+        }
+        self.last_click = Some((id, Instant::now(), drew.then(|| self.history.generation())));
     }
     pub(super) fn connect(&mut self, a: u64, b: u64) {
         if a != b
@@ -459,13 +641,6 @@ impl App {
         {
             self.history.checkpoint(&self.graph);
             self.graph.connect(a, b);
-        }
-    }
-    pub(super) fn cycle_style(&mut self, id: u64) {
-        self.history.checkpoint(&self.graph);
-        if let Some(v) = self.graph.vertex_mut(id) {
-            v.style = v.style.next();
-            self.new_style = v.style;
         }
     }
     /// Renumber every vertex from 1 and continue numbering new vertices.
@@ -482,9 +657,11 @@ impl App {
             n => format!("Relabeled 1–{n}"),
         });
     }
-    /// One vertex starts from its label; several start empty and Enter gives
-    /// them all the same label (an empty one unlabels them).
+    /// One vertex starts from its label. Several start from an empty field
+    /// that keeps their labels until something is typed; Enter then gives
+    /// them all the same label (Enter on an empty field unlabels them).
     pub(super) fn edit_label(&mut self) {
+        self.editing_placeholder = false;
         match self.selection.vertices.as_slice() {
             [] => {}
             [id] => {
@@ -492,13 +669,21 @@ impl App {
                     self.editing = Some(v.label.clone());
                 }
             }
-            _ => self.editing = Some(String::new()),
+            _ => {
+                self.editing = Some(String::new());
+                self.editing_placeholder = true;
+            }
         }
     }
-    fn commit_editing(&mut self) {
+    /// Save the label. `explicit` is Enter; a click away saves only what was
+    /// typed, so dismissing an untouched field never erases labels.
+    fn commit_editing(&mut self, explicit: bool) {
         if let Some(value) = self.editing.take() {
-            self.commit_label(value);
+            if explicit || !self.editing_placeholder {
+                self.commit_label(value);
+            }
         }
+        self.editing_placeholder = false;
     }
     #[cfg(test)]
     pub(super) fn copy_status_for_test(&mut self) {
@@ -578,50 +763,79 @@ impl App {
     fn reconcile_selection(&mut self) {
         self.selection.retain_existing(&self.graph);
     }
-    pub(super) fn toolbar(&mut self, col: u16, row: u16) {
+    /// A toolbar action from its key: like its button, and like a dimmed
+    /// button it does nothing (not even lift the pen) when it cannot apply.
+    fn shortcut(&mut self, action: super::view::ToolbarAction) {
+        if self
+            .toolbar_buttons(u16::MAX)
+            .iter()
+            .any(|b| b.action == action && b.enabled)
+        {
+            self.toolbar(action);
+        }
+    }
+    /// Run a toolbar action, from its button or its key: both lift the pen
+    /// the same way.
+    pub(super) fn toolbar(&mut self, action: super::view::ToolbarAction) {
         use super::view::ToolbarAction;
         self.status.clear();
-        match self.toolbar_action(col, row) {
-            Some(ToolbarAction::Undo) => {
+        // Viewing and copying leave the pen where it is; edits lift it.
+        if !matches!(
+            action,
+            ToolbarAction::Fit | ToolbarAction::Zoom(_) | ToolbarAction::Copy
+        ) {
+            self.edge_start = None;
+        }
+        match action {
+            ToolbarAction::Undo => {
                 self.step_history(false);
             }
-            Some(ToolbarAction::Redo) => {
+            ToolbarAction::Redo => {
                 self.step_history(true);
             }
-            Some(ToolbarAction::Fit) => {
+            ToolbarAction::Fit => {
                 let (w, h) = self.size();
                 self.camera.fit(&self.graph, w, h);
             }
-            Some(ToolbarAction::Copy) => self.copy(),
-            Some(ToolbarAction::Label) => self.edit_label(),
-            Some(ToolbarAction::Relabel) => self.restart_labels(),
-            Some(ToolbarAction::Style) => self.style_selection(),
-            Some(ToolbarAction::Connect) => self.connect_selection(),
-            Some(ToolbarAction::Delete) => self.delete_selected(),
-            Some(ToolbarAction::Zoom(factor)) => {
+            ToolbarAction::Copy => self.copy(),
+            ToolbarAction::Label => self.edit_label(),
+            ToolbarAction::Relabel => self.restart_labels(),
+            ToolbarAction::Style => self.style_selection(),
+            ToolbarAction::Connect => self.connect_selection(),
+            ToolbarAction::Delete => self.delete_selected(),
+            ToolbarAction::Zoom(factor) => {
                 let (w, h) = self.size();
                 self.camera.zoom_at(factor, w / 2., h / 2., w, h);
             }
-            None => {}
         }
-        self.edge_start = None;
         self.reconcile_selection();
         self.last_click = None;
     }
     pub(super) fn key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        use super::view::ToolbarAction;
+        // A key between two clicks makes them two clicks, not a double-click.
+        self.last_click = None;
         if let Some(s) = &mut self.editing {
             match code {
-                KeyCode::Esc => self.editing = None,
-                KeyCode::Enter => self.commit_editing(),
+                KeyCode::Esc => {
+                    self.editing = None;
+                    self.editing_placeholder = false;
+                }
+                KeyCode::Enter => self.commit_editing(true),
                 KeyCode::Backspace => {
-                    s.pop();
+                    // On the untouched field it removes nothing, so the
+                    // labels stay as they are.
+                    if s.pop().is_some() {
+                        self.editing_placeholder = false;
+                    }
                 }
                 KeyCode::Char(c)
                     if !mods.intersects(
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                     ) =>
                 {
-                    s.push(c)
+                    s.push(c);
+                    self.editing_placeholder = false;
                 }
                 _ => {}
             }
@@ -649,10 +863,18 @@ impl App {
         }
         match (code, mods) {
             (KeyCode::Char('q'), _) => {
-                if self.graph.vertices.is_empty()
-                    || self.delivered.as_ref() == Some(&self.graph)
-                    || self.quit_pending
-                {
+                // Deleting (or undoing) everything is no excuse to lose a
+                // drawing that only Undo or Redo still holds.
+                let safe = if self.graph.vertices.is_empty() {
+                    // Safe only if no drawing on either side is uncopied.
+                    self.history
+                        .nearest_drawings()
+                        .iter()
+                        .all(|d| d.is_none() || *d == self.delivered.as_ref())
+                } else {
+                    self.delivered.as_ref() == Some(&self.graph)
+                };
+                if safe || self.quit_pending {
                     return true;
                 }
                 self.quit_pending = true;
@@ -676,16 +898,16 @@ impl App {
             (KeyCode::Char('r' | 'y'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.step_history(true)
             }
-            (KeyCode::Enter, _) => self.edit_label(),
+            (KeyCode::Enter, _) => self.shortcut(ToolbarAction::Label),
             (KeyCode::Char('a'), m) if m.is_empty() || m.contains(KeyModifiers::CONTROL) => {
                 self.select_all()
             }
-            (KeyCode::Char('s'), m) if m.is_empty() => self.style_selection(),
+            (KeyCode::Char('s'), m) if m.is_empty() => self.shortcut(ToolbarAction::Style),
             (KeyCode::Char('R'), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                self.restart_labels()
+                self.shortcut(ToolbarAction::Relabel)
             }
-            (KeyCode::Char('c'), m) if m.is_empty() => self.connect_selection(),
-            (KeyCode::Delete | KeyCode::Backspace, _) => self.delete_selected(),
+            (KeyCode::Char('c'), m) if m.is_empty() => self.shortcut(ToolbarAction::Connect),
+            (KeyCode::Delete | KeyCode::Backspace, _) => self.shortcut(ToolbarAction::Delete),
             (KeyCode::Char('+') | KeyCode::Char('='), _) => {
                 let (w, h) = self.size();
                 self.camera.zoom_at(1.2, w / 2., h / 2., w, h);
@@ -874,7 +1096,7 @@ mod tests {
         assert!(!app.history.undo(&mut app.graph));
         click(&mut app, 40, 12);
         assert_eq!(app.selection, Selection::vertex(1));
-        assert_eq!(app.edge_start, Some(1));
+        assert_eq!(app.edge_start, None, "narrowing does not pick up the pen");
     }
     #[test]
     fn button_release_preserves_operation_errors() {
@@ -882,33 +1104,6 @@ mod tests {
         app.status = "Copy failed".into();
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 2, 0);
         assert_eq!(app.status, "Copy failed");
-    }
-    #[test]
-    fn hover_add_and_connect_work_without_modes() {
-        let mut app = app();
-        let original = app.graph.clone();
-        mouse(&mut app, MouseEventKind::Moved, 52, 12);
-        assert_eq!(app.hover, Some((2., 0.)));
-        assert_eq!(app.graph, original);
-        click(&mut app, 52, 12);
-        assert_eq!(app.graph.vertices.len(), 2);
-        assert!(app.graph.edges.is_empty());
-        assert!(app.edge_start.is_none());
-        click(&mut app, 40, 12);
-        assert_eq!(app.edge_start, Some(1));
-        click(&mut app, 52, 12);
-        assert_eq!(app.graph.edges.len(), 1);
-        assert!(app.edge_start.is_none());
-        assert!(app.history.undo(&mut app.graph));
-        assert!(app.graph.edges.is_empty());
-        assert_eq!(app.graph.vertices.len(), 2);
-        app.last_click = None;
-        click(&mut app, 40, 12);
-        click(&mut app, 52, 12);
-        app.last_click = None;
-        click(&mut app, 40, 12);
-        click(&mut app, 52, 12);
-        assert_eq!(app.graph.edges.len(), 1); // no duplicate connections
     }
     #[test]
     fn drag_follows_pointer_marks_landing_and_collision_rolls_back() {
@@ -941,28 +1136,6 @@ mod tests {
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 52, 12);
         assert_eq!(app.graph, original); // exact collision uses release position
         assert!(app.graph.validate().is_ok());
-    }
-    #[test]
-    fn double_click_cycles_style_and_right_drag_only_pans() {
-        let mut app = app();
-        click(&mut app, 40, 12);
-        click(&mut app, 40, 12);
-        assert_eq!(app.graph.vertices[0].style, VertexStyle::Circles);
-        assert!(app.edge_start.is_none());
-        app.last_click = None;
-        click(&mut app, 52, 12); // new vertex inherits the last chosen style
-        assert_eq!(app.graph.vertices.len(), 2);
-        assert_eq!(app.graph.vertices[1].style, VertexStyle::Circles);
-        app.graph.vertices.pop();
-        app.selection = Selection::default();
-        let original = app.graph.clone();
-        let camera = app.camera;
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), 40, 12);
-        mouse(&mut app, MouseEventKind::Drag(MouseButton::Right), 46, 12);
-        mouse(&mut app, MouseEventKind::Up(MouseButton::Right), 46, 12);
-        assert_ne!(app.camera, camera);
-        assert_eq!(app.graph, original);
-        assert!(app.drag.is_none());
     }
     #[test]
     fn completed_drag_is_one_undo_step_and_escape_restores_preview() {
@@ -1000,24 +1173,6 @@ mod tests {
         mouse(&mut app, MouseEventKind::Down(MouseButton::Right), 40, 15);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Right), 41, 15);
         assert_eq!(app.hover, None, "no placement marker while panning");
-    }
-    #[test]
-    fn clicking_while_editing_saves_the_label_then_acts() {
-        let mut app = app();
-        app.selection = Selection::vertex(1);
-        app.edit_label();
-        app.key(KeyCode::Char('x'), KeyModifiers::NONE);
-        // The canvas previews the typed label before it is saved.
-        assert_eq!(app.scene().state.graph.vertices[0].label, "1x");
-        assert_eq!(app.graph.vertices[0].label, "1");
-        click(&mut app, 52, 12);
-        assert!(app.editing.is_none());
-        assert_eq!(app.graph.vertices[0].label, "1x");
-        assert_eq!(
-            app.graph.vertices.len(),
-            2,
-            "the click also placed a vertex"
-        );
     }
     #[test]
     fn arrows_nudge_selection_one_unit_or_pan() {
@@ -1148,5 +1303,445 @@ mod tests {
         assert_eq!(app.editing.as_deref(), Some("1u"));
         app.key(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.graph, original);
+    }
+
+    #[test]
+    fn the_pen_draws_paths_by_clicking_along_them() {
+        // One world unit is 6 columns by 3 rows; vertex 1 sits at column 40, row 12.
+        let mut app = app();
+        mouse(&mut app, MouseEventKind::Moved, 52, 12);
+        assert_eq!(app.hover, Some((2., 0.)));
+        // Placing a vertex puts the pen on it; with no pen before, no edge.
+        click(&mut app, 52, 12);
+        let b = app.selection.vertices[0];
+        assert!(app.graph.edges.is_empty());
+        assert_eq!(app.edge_start, Some(b));
+        // Each empty click places the next vertex, joined to the last.
+        click(&mut app, 64, 12);
+        let c = app.selection.vertices[0];
+        assert_eq!(app.graph.edges, vec![Edge { a: b, b: c }]);
+        assert_eq!(app.edge_start, Some(c));
+        // Clicking an existing vertex joins it and moves the pen there.
+        app.last_click = None;
+        click(&mut app, 40, 12);
+        assert_eq!(app.graph.edges.len(), 2);
+        assert_eq!(app.edge_start, Some(1));
+        // Going back along an existing edge only moves the pen: no duplicate.
+        app.last_click = None;
+        click(&mut app, 64, 12);
+        assert_eq!(app.graph.edges.len(), 2);
+        assert_eq!(app.edge_start, Some(c));
+        // Clicking the pen's own vertex lifts it; so do Esc and right-click.
+        app.last_click = None;
+        click(&mut app, 64, 12);
+        assert_eq!(app.edge_start, None);
+        click(&mut app, 40, 12);
+        assert!(!app.key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.edge_start, None);
+        app.last_click = None;
+        click(&mut app, 40, 12);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), 40, 15);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Right), 40, 15);
+        assert_eq!(app.edge_start, None);
+        // Placing and joining a vertex is one undo step.
+        let before = app.graph.clone();
+        app.last_click = None;
+        click(&mut app, 40, 12);
+        click(&mut app, 40, 18);
+        assert_eq!(app.graph.vertices.len(), 4);
+        assert_eq!(app.graph.edges.len(), 3);
+        let steps = app.history.depth();
+        app.step_history(false);
+        assert_eq!(app.graph, before);
+        assert_eq!(app.history.depth(), steps - 1, "one step, not two");
+        assert_eq!(app.edge_start, None, "undo lifts the pen");
+    }
+    #[test]
+    fn clicks_near_a_vertex_select_it_and_a_release_off_canvas_cancels() {
+        let mut app = app();
+        let b = app.graph.add_vertex(2., 0.);
+        let before = app.graph.clone();
+        // Column 50 is outside vertex b's 16 px mark but rounds to its grid
+        // point: it is a click on b, not a lost click.
+        app.selection = Selection::vertex(1);
+        click(&mut app, 50, 12);
+        assert_eq!(app.selection, Selection::vertex(b));
+        assert_eq!(app.graph, before);
+        // Pressing on canvas and releasing over the toolbar places nothing.
+        app.edge_start = None;
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 40, 18);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 40, 0);
+        assert_eq!(app.graph, before);
+    }
+    #[test]
+    fn zoomed_in_circles_and_plain_labels_are_clickable() {
+        let mut app = app();
+        app.graph.vertices[0].style = VertexStyle::Circles;
+        app.camera.zoom = 96.;
+        let (w, h) = app.size();
+        let center = app.camera.world_to_screen(0., 0., w, h);
+        let ring = super::super::canvas::sizes(96.).ring;
+        assert!(ring > 16.);
+        assert_eq!(
+            app.hit((center.0 + ring, center.1)),
+            Some(1),
+            "on the drawn ring"
+        );
+        assert_eq!(
+            app.hit((center.0 + 96. * 0.6, center.1)),
+            None,
+            "past half a grid step"
+        );
+        // A plain vertex is its label: clicking the word selects it.
+        let mut app = super::super::test_support::app();
+        app.graph.vertices[0].style = VertexStyle::Plain;
+        app.graph.vertices[0].label = "hypotenuse".into();
+        let (w, h) = app.size();
+        let center = app.camera.world_to_screen(0., 0., w, h);
+        let word = (center.0 + 20., center.1);
+        assert_eq!(app.hit(word), None);
+        assert_eq!(app.hit_label(word), Some(1));
+        app.selection = Selection::default();
+        app.left_down(word, KeyModifiers::NONE);
+        app.left_up(Some(word));
+        assert_eq!(app.selection, Selection::vertex(1));
+        assert_eq!(
+            app.graph.vertices.len(),
+            1,
+            "no vertex placed under the word"
+        );
+    }
+    #[test]
+    fn double_click_edits_the_label_and_right_drag_only_pans() {
+        let mut app = app();
+        click(&mut app, 40, 12);
+        click(&mut app, 40, 12);
+        assert_eq!(app.editing.as_deref(), Some("1"));
+        assert_eq!(app.edge_start, None);
+        assert_eq!(app.graph.vertices[0].style, VertexStyle::Dots);
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        // Style is `s` (or the button); new vertices take the last style.
+        app.key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.graph.vertices[0].style, VertexStyle::Circles);
+        app.edge_start = None;
+        click(&mut app, 52, 12);
+        assert_eq!(app.graph.vertices[1].style, VertexStyle::Circles);
+        app.graph.vertices.pop();
+        app.selection = Selection::default();
+        app.edge_start = None;
+        let original = app.graph.clone();
+        let camera = app.camera;
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), 40, 12);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Right), 46, 12);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Right), 46, 12);
+        assert_ne!(app.camera, camera);
+        assert_eq!(app.graph, original);
+        assert!(app.drag.is_none());
+    }
+    #[test]
+    fn clicking_away_saves_only_typed_labels_and_does_nothing_else() {
+        let mut app = app();
+        app.selection = Selection::vertex(1);
+        app.edit_label();
+        app.key(KeyCode::Char('x'), KeyModifiers::NONE);
+        // The canvas previews the typed label before it is saved.
+        assert_eq!(app.preview_graph().vertices[0].label, "1x");
+        assert_eq!(app.graph.vertices[0].label, "1");
+        click(&mut app, 52, 12);
+        assert!(app.editing.is_none());
+        assert_eq!(app.graph.vertices[0].label, "1x");
+        assert_eq!(app.graph.vertices.len(), 1, "the click only saved");
+        // Several vertices: an untouched field keeps their labels, even when
+        // the click lands where a toolbar button would be.
+        let b = app.graph.add_vertex(2., 0.);
+        let before = app.graph.clone();
+        app.selection.vertices = vec![1, b];
+        app.edit_label();
+        assert_eq!(app.preview_graph(), before);
+        let delete = app
+            .toolbar_buttons(80)
+            .iter()
+            .find(|b| b.action == super::super::view::ToolbarAction::Delete)
+            .unwrap()
+            .start as u16;
+        click(&mut app, delete, 0);
+        assert!(app.editing.is_none());
+        assert_eq!(app.graph, before);
+        // Enter on the empty field unlabels them on purpose.
+        app.edit_label();
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.graph.vertices.iter().all(|v| v.label.is_empty()));
+    }
+    #[test]
+    fn toolbar_buttons_stay_put_and_act_on_release_over_the_same_button() {
+        use super::super::view::ToolbarAction;
+        let mut app = app();
+        let b = app.graph.add_vertex(2., 0.);
+        let c = app.graph.add_vertex(4., 0.);
+        let at = |app: &App, action| {
+            app.toolbar_buttons(80)
+                .iter()
+                .find(|x| x.action == action)
+                .unwrap()
+                .start as u16
+                + 1
+        };
+        let empty = app.toolbar_buttons(80);
+        app.selection.vertices = vec![1, b, c];
+        let connect = at(&app, ToolbarAction::Connect);
+        assert_eq!(
+            empty.iter().map(|b| b.start).collect::<Vec<_>>(),
+            app.toolbar_buttons(80)
+                .iter()
+                .map(|b| b.start)
+                .collect::<Vec<_>>(),
+            "selection never moves a button"
+        );
+        // Pressing and sliding off cancels.
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            connect,
+            0,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            connect + 30,
+            0,
+        );
+        assert!(app.graph.edges.is_empty());
+        // Two quick clicks on Connect: the second hits a dimmed Connect, not Delete.
+        click(&mut app, connect, 0);
+        assert_eq!(app.graph.edges.len(), 3);
+        assert!(app.status.contains("3 edges"));
+        click(&mut app, connect, 0);
+        assert_eq!(app.graph.vertices.len(), 3);
+        assert_eq!(app.graph.edges.len(), 3);
+        // A dimmed button or blank space leaves the pen down.
+        app.edge_start = Some(1);
+        let redo = at(&app, ToolbarAction::Redo);
+        click(&mut app, redo, 0);
+        click(&mut app, 70, 0);
+        assert_eq!(app.edge_start, Some(1));
+    }
+    #[test]
+    fn quitting_asks_while_undo_still_holds_an_uncopied_drawing() {
+        let mut app = app();
+        app.graph.add_vertex(2., 0.);
+        app.key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(app.graph.vertices.is_empty());
+        assert!(!app.key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.status.contains("Not copied"));
+        // Once that drawing was copied, an empty canvas quits at once.
+        app.step_history(false);
+        app.delivered = Some(app.graph.clone());
+        app.key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(app.key(KeyCode::Char('q'), KeyModifiers::NONE));
+    }
+    #[test]
+    fn clicks_act_on_the_zoom_on_screen_until_the_new_frame_arrives() {
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut app = App::new(Graph::default(), picker);
+        app.graph.add_vertex(0., 0.);
+        app.area = Rect::new(0, 1, 80, 23);
+        let shown = app.camera;
+        let (scale, area, cell) = (app.device_scale(), app.area, app.picker.font_size());
+        if let Some(canvas) = &mut app.kitty {
+            canvas.stage_frame(graphics::KittyFrame {
+                upload: String::new(),
+                camera: shown,
+                margin: (0, 0),
+                omits: Vec::new(),
+                hides: None,
+            });
+            canvas.stage_view(shown, scale, area, cell);
+        }
+        app.camera.zoom *= 2.;
+        assert_eq!(app.displayed_camera(), shown);
+        // Where vertex 1 is drawn on screen, not where the new zoom puts it.
+        let (w, h) = app.size();
+        let on_screen = shown.world_to_screen(0., 0., w, h);
+        let col = (on_screen.0 / app.cell.0) as u16;
+        let row = (on_screen.1 / app.cell.1) as u16 + 1;
+        app.selection = Selection::default();
+        click(&mut app, col, row);
+        assert_eq!(app.selection, Selection::vertex(1));
+        assert_eq!(app.graph.vertices.len(), 1);
+        // Toolbar zoom still changes the real camera meanwhile.
+        let zoom = app.camera.zoom;
+        let plus = app.toolbar_buttons(80).last().unwrap().start as u16 + 1;
+        click(&mut app, plus, 0);
+        assert!(app.camera.zoom > zoom, "the zoom click must not be lost");
+    }
+
+    #[test]
+    fn a_box_selection_moves_by_its_vertices_edges_or_the_area_between() {
+        // One world unit is 6 columns by 3 rows; vertex 1 sits at column 40, row 12.
+        let mut app = app();
+        let b = app.graph.add_vertex(4., 0.);
+        let c = app.graph.add_vertex(0., 2.);
+        app.graph.connect(1, b);
+        let select_all = |app: &mut App| {
+            mouse(app, MouseEventKind::Down(MouseButton::Left), 30, 22);
+            mouse(app, MouseEventKind::Drag(MouseButton::Left), 75, 3);
+            mouse(app, MouseEventKind::Up(MouseButton::Left), 75, 3);
+            assert!(app.selection.vertices.len() >= 3);
+        };
+        let drag = |app: &mut App, from: (u16, u16), to: (u16, u16)| {
+            mouse(app, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+            mouse(app, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+            mouse(app, MouseEventKind::Up(MouseButton::Left), to.0, to.1);
+        };
+        let xs = |app: &App| app.graph.vertices.iter().map(|v| v.x).collect::<Vec<_>>();
+        // By the selected edge between 1 and b.
+        select_all(&mut app);
+        drag(&mut app, (52, 12), (58, 12));
+        assert_eq!(xs(&app), [1., 5., 1.]);
+        assert_eq!(app.selection.vertices.len(), 3, "the selection survives");
+        // By empty canvas inside the selection's box, then a vertex.
+        drag(&mut app, (52, 6), (58, 6));
+        assert_eq!(xs(&app), [2., 6., 2.]);
+        drag(&mut app, (52, 12), (46, 12));
+        assert_eq!(xs(&app), [1., 5., 1.]);
+        assert_eq!(app.graph.vertices.len(), 3);
+        assert!(app.graph.vertex(c).is_some());
+        // A click (no move) inside the box deselects and places nothing.
+        click(&mut app, 52, 6);
+        assert_eq!(app.graph.vertices.len(), 3);
+        assert!(app.selection.is_empty());
+        // A click on a selected edge selects just that edge.
+        select_all(&mut app);
+        click(&mut app, 58, 12);
+        assert_eq!(app.selection, Selection::edge(Edge { a: 1, b }));
+    }
+
+    #[test]
+    fn round_three_gesture_regressions_stay_fixed() {
+        // Double-clicking B to label it, with the pen down at 1, adds no edge.
+        let mut app = app();
+        let b = app.graph.add_vertex(2., 0.);
+        let before = app.graph.clone();
+        app.edge_start = Some(1);
+        click(&mut app, 52, 12);
+        click(&mut app, 52, 12);
+        assert_eq!(app.editing.as_deref(), Some(b.to_string().as_str()));
+        assert_eq!(app.graph, before, "the label gesture took its edge back");
+        assert!(!app.history.can_redo());
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        // A key between two clicks makes them two clicks.
+        click(&mut app, 52, 12);
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        click(&mut app, 52, 12);
+        assert!(app.editing.is_none());
+        // Backspace on the untouched multi-label field keeps the labels.
+        app.edge_start = None;
+        app.selection.vertices = vec![1, b];
+        app.edit_label();
+        app.key(KeyCode::Backspace, KeyModifiers::NONE);
+        click(&mut app, 70, 18);
+        assert_eq!(app.graph, before);
+        // A press on canvas released off it leaves the pen down.
+        app.edge_start = Some(1);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 40, 18);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 40, 0);
+        assert_eq!(app.edge_start, Some(1));
+        // Grabbing a selected vertex carries the selected edge's ends too.
+        let c = app.graph.add_vertex(0., 2.);
+        let d = app.graph.add_vertex(2., 2.);
+        app.graph.connect(c, d);
+        app.edge_start = None;
+        app.selection = Selection {
+            vertices: vec![1],
+            edges: vec![Edge { a: c, b: d }],
+        };
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 40, 12);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 46, 12);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 46, 12);
+        let x = |app: &App, id| app.graph.vertex(id).unwrap().x;
+        assert_eq!((x(&app, 1), x(&app, c), x(&app, d)), (1., 1., 3.));
+    }
+    #[test]
+    fn shortcuts_lift_the_pen_like_their_buttons() {
+        let mut app = app();
+        let b = app.graph.add_vertex(2., 0.);
+        app.selection = Selection::vertex(1);
+        app.edge_start = Some(1);
+        app.key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.edge_start, None);
+        click(&mut app, 52, 12);
+        assert!(app.graph.edges.is_empty(), "no edge from a pen `s` lifted");
+        assert_eq!(app.edge_start, Some(b));
+    }
+    #[test]
+    fn quitting_asks_while_redo_holds_an_uncopied_drawing() {
+        let mut app = app();
+        app.graph = Graph::default();
+        app.edge_start = None;
+        click(&mut app, 40, 12);
+        app.step_history(false);
+        assert!(app.graph.vertices.is_empty());
+        assert!(!app.key(KeyCode::Char('q'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_label_double_click_restores_history_exactly() {
+        let mut app = app();
+        let b = app.graph.add_vertex(2., 0.);
+        // A Redo step, and Undo at its cap: neither may be lost.
+        app.history.checkpoint(&app.graph);
+        app.history.undo(&mut app.graph);
+        let redo_graph = app.graph.clone();
+        for _ in 0..100 {
+            let g = app.graph.clone();
+            app.history.checkpoint(&g);
+        }
+        // That checkpoint loop cleared Redo; make one again.
+        app.history.redo(&mut app.graph);
+        app.history.undo(&mut app.graph);
+        assert!(app.history.can_redo());
+        let before = app.graph.clone();
+        let depth = app.history.depth();
+        app.edge_start = Some(1);
+        click(&mut app, 52, 12);
+        click(&mut app, 52, 12);
+        assert!(app.editing.is_some());
+        assert_eq!(app.graph, before, "no edge, even at the undo cap");
+        assert_eq!(app.history.depth(), depth);
+        assert!(app.history.can_redo(), "Redo survives the label gesture");
+        let _ = (b, redo_graph);
+        // Right-click between two clicks makes them two clicks.
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        click(&mut app, 52, 12);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), 40, 18);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Right), 40, 18);
+        click(&mut app, 52, 12);
+        assert!(app.editing.is_none());
+    }
+    #[test]
+    fn quit_asks_if_either_side_of_history_holds_uncopied_work() {
+        let mut app = app();
+        // Undo holds an uncopied drawing (vertex 1), Redo a copied one.
+        let uncopied = app.graph.clone();
+        app.history.checkpoint(&uncopied);
+        app.graph = Graph::default();
+        app.history.checkpoint(&app.graph);
+        app.graph = uncopied.clone();
+        app.graph.add_vertex(2., 0.);
+        app.delivered = Some(app.graph.clone());
+        app.history.undo(&mut app.graph);
+        assert!(app.graph.vertices.is_empty() && app.history.can_redo());
+        assert!(!app.key(KeyCode::Char('q'), KeyModifiers::NONE));
+    }
+    #[test]
+    fn a_shortcut_that_cannot_apply_leaves_the_pen_down() {
+        let mut app = app();
+        app.selection = Selection::vertex(1);
+        app.edge_start = Some(1);
+        app.key(KeyCode::Char('c'), KeyModifiers::NONE); // one vertex: nothing to connect
+        assert_eq!(app.edge_start, Some(1));
     }
 }

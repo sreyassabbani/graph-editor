@@ -43,6 +43,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// What a press that may become a move started on.
+#[derive(Clone, Copy)]
+enum Grab {
+    Vertex,
+    /// A selected edge: a click selects just it.
+    Edge(Edge),
+    /// Empty canvas inside a multi-selection's box: a click deselects.
+    Empty,
+}
+
 enum Drag {
     /// Dragging `anchor` moves every vertex in `ids` (the selection) together.
     Vertices {
@@ -53,6 +63,8 @@ enum Drag {
         moved: bool,
         /// A plain click on a member of a multi-selection narrows it to that vertex.
         narrow: bool,
+        /// What was pressed, for a click that never moves.
+        grab: Grab,
     },
     /// Rubber-band selection in screen coordinates.
     Marquee {
@@ -155,7 +167,57 @@ struct CanvasState {
     hover: Option<(f64, f64)>,
     /// Rubber-band rectangle (two screen-space corners) while dragging one.
     marquee: Option<((f64, f64), (f64, f64))>,
+    /// The edge under the pointer, highlighted faintly.
+    hover_edge: Option<Edge>,
     size: (u32, u32),
+    layer: Layer,
+    /// Turn of the pen's dashed ring ([`canvas::SPIN_STEPS`] per dash), and the edge it is unrolling into: from, to and progress in
+    /// thousandths. Only the Kitty pen layer animates.
+    spin: u16,
+    unroll: Option<(u64, u64, u16)>,
+    /// An edge a frame leaves out while it is animated in; the pen layer
+    /// draws it until a frame that has it arrives.
+    hide_edge: Option<Edge>,
+}
+
+/// Which parts of the scene a frame draws. While vertices are dragged or
+/// relabeled on Kitty, one frame holds everything that stays put and the
+/// changing part is redrawn as small tiles, so each pointer move or keystroke
+/// sends kilobytes instead of a whole canvas.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum Layer {
+    #[default]
+    All,
+    /// Everything except these vertices and their edges.
+    Still(Vec<u64>),
+    /// Only these vertices, their labels and their edges.
+    Moving(Vec<u64>),
+    /// Only the marks drawn over a Kitty frame: selection highlights, the
+    /// edge-start ring and the hovered edge. Clicks that only change these
+    /// redraw a few tiles instead of the canvas.
+    Decor,
+    /// Only the pen: its rotating ring and an edge it unrolls into, drawn
+    /// behind the frame so labels and marks stay on top.
+    Pen,
+}
+
+impl Layer {
+    fn shows_vertex(&self, id: u64) -> bool {
+        match self {
+            Layer::All => true,
+            Layer::Still(ids) => !ids.contains(&id),
+            Layer::Moving(ids) => ids.contains(&id),
+            Layer::Decor | Layer::Pen => false,
+        }
+    }
+    fn shows_edge(&self, a: u64, b: u64) -> bool {
+        match self {
+            Layer::All => true,
+            Layer::Still(ids) => !ids.contains(&a) && !ids.contains(&b),
+            Layer::Moving(ids) => ids.contains(&a) || ids.contains(&b),
+            Layer::Decor | Layer::Pen => false,
+        }
+    }
 }
 
 struct App {
@@ -168,16 +230,34 @@ struct App {
     new_unlabeled: bool,
     delivered: Option<Graph>,
     selection: Selection,
+    /// The pen: the vertex the next click draws an edge from.
     edge_start: Option<u64>,
     hover: Option<(f64, f64)>,
+    hover_edge: Option<Edge>,
     drag: Option<Drag>,
-    last_click: Option<(u64, Instant)>,
+    /// The last plain vertex click, for double-clicks, and the history
+    /// generation of the edge it drew, if any (so a double-click can take
+    /// that edge back).
+    last_click: Option<(u64, Instant, Option<u64>)>,
+    /// The pen's ring unrolling into the edge it just drew: from, to, start.
+    unroll: Option<(u64, u64, Instant)>,
+    /// The pen ring's turn in dashes (0..1), how far it has spun up (0..1),
+    /// and when that was last advanced.
+    spin_pos: f64,
+    spin_ramp: f64,
+    spin_at: Instant,
+    last_input: Instant,
     editing: Option<String>,
+    /// Labeling several vertices starts with an empty field that stands for
+    /// "keep their labels" until the user types or presses Enter.
+    editing_placeholder: bool,
     status: String,
     /// When `status` was set; results clear themselves after [`STATUS_TTL`].
     status_at: Option<Instant>,
     /// Toolbar column under the pointer, for button highlighting.
     toolbar_hover: Option<u16>,
+    /// The toolbar button pressed; it acts on release over the same button.
+    toolbar_press: Option<view::ToolbarAction>,
     area: Rect,
     cell: (f64, f64),
     picker: Picker,
@@ -187,6 +267,12 @@ struct App {
     scene_dirty: bool,
     quit_pending: bool,
     canvas_state: Option<CanvasState>,
+    /// The dragged layer the shown tiles were drawn from.
+    tiles_state: Option<CanvasState>,
+    /// The decorations the shown decor tiles were drawn from.
+    decor_state: Option<CanvasState>,
+    /// The pen layer the shown pen tiles were drawn from.
+    pen_state: Option<CanvasState>,
     protocol: Option<StatefulProtocol>,
     fit_on_open: bool,
     /// The terminal reports mouse positions in pixels (SGR-Pixels, mode 1016)
@@ -291,12 +377,20 @@ impl App {
             selection: Selection::default(),
             edge_start: None,
             hover: None,
+            hover_edge: None,
             drag: None,
             last_click: None,
+            unroll: None,
+            spin_pos: 0.,
+            spin_ramp: 0.,
+            spin_at: Instant::now(),
+            last_input: Instant::now(),
             editing: None,
+            editing_placeholder: false,
             status: String::new(),
             status_at: None,
             toolbar_hover: None,
+            toolbar_press: None,
             area: Rect::default(),
             cell,
             picker,
@@ -305,6 +399,9 @@ impl App {
             dirty: true,
             scene_dirty: true,
             canvas_state: None,
+            tiles_state: None,
+            decor_state: None,
+            pen_state: None,
             protocol: None,
             fit_on_open: true,
             pixel_mouse: false,
