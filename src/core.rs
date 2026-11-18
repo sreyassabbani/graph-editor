@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VertexStyle {
@@ -6,6 +6,29 @@ pub enum VertexStyle {
     Dots,
     Circles,
     Plain,
+}
+
+impl VertexStyle {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dots => Self::Circles,
+            Self::Circles => Self::Plain,
+            Self::Plain => Self::Dots,
+        }
+    }
+    /// The `typst/graph.typ` style name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dots => "dots",
+            Self::Circles => "circles",
+            Self::Plain => "plain",
+        }
+    }
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Dots, Self::Circles, Self::Plain]
+            .into_iter()
+            .find(|s| s.name() == name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -17,7 +40,7 @@ pub struct Vertex {
     pub style: VertexStyle,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Edge {
     pub a: u64,
     pub b: u64,
@@ -28,6 +51,9 @@ pub struct Graph {
     pub vertices: Vec<Vertex>,
     pub edges: Vec<Edge>,
     pub next_id: u64,
+    /// Label for the next numbered vertex; independent of IDs so labeling
+    /// can restart at 1 without disturbing stable references.
+    pub next_label: u64,
 }
 
 impl Default for Graph {
@@ -36,6 +62,7 @@ impl Default for Graph {
             vertices: Vec::new(),
             edges: Vec::new(),
             next_id: 1,
+            next_label: 1,
         }
     }
 }
@@ -44,16 +71,48 @@ impl Graph {
     /// Add a vertex at finite, unoccupied coordinates. Callers must check these
     /// preconditions before insertion. Panics if the vertex ID space is exhausted.
     pub fn add_vertex(&mut self, x: f64, y: f64) -> u64 {
+        self.add_styled_vertex(x, y, VertexStyle::default(), true)
+    }
+
+    /// Like [`Graph::add_vertex`], with an explicit drawing style. Unnumbered
+    /// vertices get an empty label and do not consume a number.
+    pub fn add_styled_vertex(&mut self, x: f64, y: f64, style: VertexStyle, numbered: bool) -> u64 {
         let id = self.next_id;
         self.next_id = id.checked_add(1).expect("vertex ID space exhausted");
+        let label = if numbered {
+            let label = self.next_label;
+            self.next_label = label.saturating_add(1);
+            label.to_string()
+        } else {
+            String::new()
+        };
         self.vertices.push(Vertex {
             id,
             x,
             y,
-            label: id.to_string(),
-            style: VertexStyle::default(),
+            label,
+            style,
         });
         id
+    }
+
+    /// Whether labels already read 1..=n in creation order with n + 1 next,
+    /// so [`Graph::restart_labels`] would change nothing.
+    pub fn labels_in_order(&self) -> bool {
+        self.next_label == self.vertices.len() as u64 + 1
+            && self
+                .vertices
+                .iter()
+                .enumerate()
+                .all(|(i, v)| v.label == (i + 1).to_string())
+    }
+
+    /// Number every vertex 1..=n in creation order; the next vertex gets n + 1.
+    pub fn restart_labels(&mut self) {
+        for (i, v) in self.vertices.iter_mut().enumerate() {
+            v.label = (i + 1).to_string();
+        }
+        self.next_label = self.vertices.len() as u64 + 1;
     }
 
     pub fn remove_vertex(&mut self, id: u64) {
@@ -95,6 +154,28 @@ impl Graph {
         }
     }
 
+    /// Move every vertex in `ids` by (dx, dy) at once. Refuses (and changes
+    /// nothing) if any moved vertex would land on a vertex that stays put, or
+    /// if coordinates stop being finite or distinct.
+    pub fn translate(&mut self, ids: &[u64], dx: f64, dy: f64) -> bool {
+        let moving: HashSet<u64> = ids.iter().copied().collect();
+        let mut occupied = HashSet::new();
+        for v in self.vertices.iter().filter(|v| !moving.contains(&v.id)) {
+            occupied.insert(position_key(v.x, v.y));
+        }
+        for v in self.vertices.iter().filter(|v| moving.contains(&v.id)) {
+            let (x, y) = (v.x + dx, v.y + dy);
+            if !x.is_finite() || !y.is_finite() || !occupied.insert(position_key(x, y)) {
+                return false;
+            }
+        }
+        for v in self.vertices.iter_mut().filter(|v| moving.contains(&v.id)) {
+            v.x += dx;
+            v.y += dy;
+        }
+        true
+    }
+
     pub fn vertex(&self, id: u64) -> Option<&Vertex> {
         self.vertices.iter().find(|vertex| vertex.id == id)
     }
@@ -113,9 +194,7 @@ impl Graph {
             if vertex.id == 0 || !ids.insert(vertex.id) {
                 return Err("vertex IDs must be unique and nonzero".into());
             }
-            // Normalize signed zero, which compares equal but has a different bit representation.
-            let bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
-            if !positions.insert((bits(vertex.x), bits(vertex.y))) {
+            if !positions.insert(position_key(vertex.x, vertex.y)) {
                 return Err("vertices must occupy distinct positions".into());
             }
             if vertex.id >= self.next_id {
@@ -196,10 +275,11 @@ impl Camera {
         }
         self.x = min_x / 2.0 + max_x / 2.0;
         self.y = min_y / 2.0 + max_y / 2.0;
-        // Leave one world unit of padding on each side, including single vertices.
+        // Leave one world unit of padding on each side; never magnify past
+        // twice the default, so fitting one vertex does not fill the screen.
         self.zoom = (width / (max_x - min_x + 2.0))
             .min(height / (max_y - min_y + 2.0))
-            .clamp(8.0, 256.0);
+            .clamp(8.0, 2.0 * Camera::default().zoom);
     }
 }
 
@@ -213,6 +293,12 @@ impl History {
     pub fn checkpoint(&mut self, graph: &Graph) {
         Self::push_bounded(&mut self.undo, graph.clone());
         self.redo.clear();
+    }
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
     pub fn undo(&mut self, graph: &mut Graph) -> bool {
         if let Some(previous) = self.undo.pop() {
@@ -235,6 +321,114 @@ impl History {
             stack.remove(0);
         }
         stack.push(graph);
+    }
+}
+
+/// Hashable position. Normalizes signed zero, which compares equal but has a
+/// different bit representation.
+fn position_key(x: f64, y: f64) -> (u64, u64) {
+    let bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
+    (bits(x), bits(y))
+}
+
+/// Compass directions for dot labels, in the order `typst/graph.typ` tries them.
+pub const COMPASS: [(&str, (f64, f64)); 8] = [
+    ("n", (0., 1.)),
+    ("ne", (1., 1.)),
+    ("e", (1., 0.)),
+    ("se", (1., -1.)),
+    ("s", (0., -1.)),
+    ("sw", (-1., -1.)),
+    ("w", (-1., 0.)),
+    ("nw", (-1., 1.)),
+];
+
+/// `typst/graph.typ` defaults in coordinate units: (radius + label-gap) / unit
+/// and (label-gap + 4pt) / unit with unit = 12mm.
+pub const UNIT_PT: f64 = 12. * 72. / 25.4;
+pub const LABEL_REACH: f64 = 8.8 / UNIT_PT;
+pub const LABEL_CAP: f64 = 11. / UNIT_PT;
+
+fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length = dx * dx + dy * dy;
+    let t = if length == 0. {
+        0.
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / length).clamp(0., 1.)
+    };
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+impl Graph {
+    /// Index into [`COMPASS`] for every vertex's label. Mirrors the automatic
+    /// placement in `typst/graph.typ` so the editor previews the compiled PDF.
+    pub fn label_directions(&self, reach: f64, cap: f64) -> HashMap<u64, usize> {
+        let vs = &self.vertices;
+        if vs.is_empty() {
+            return HashMap::new();
+        }
+        let n = vs.len() as f64;
+        let center = (
+            vs.iter().map(|v| v.x).sum::<f64>() / n,
+            vs.iter().map(|v| v.y).sum::<f64>() / n,
+        );
+        if vs.iter().all(|v| (v.y - center.1).abs() < 0.001) {
+            return vs.iter().map(|v| (v.id, 0)).collect(); // a single row: all north
+        }
+        let at: HashMap<u64, (f64, f64)> = vs.iter().map(|v| (v.id, (v.x, v.y))).collect();
+        let segments: Vec<_> = self.edges.iter().map(|e| (at[&e.a], at[&e.b])).collect();
+        let mut first = Vec::with_capacity(vs.len());
+        let mut clear = Vec::with_capacity(vs.len());
+        for v in vs {
+            let out = (v.x - center.0, v.y - center.1);
+            let out_norm = out.0.hypot(out.1).max(1e-9);
+            let (mut best, mut best_score) = (0, f64::NEG_INFINITY);
+            let mut clearances = [0.; 8];
+            for (i, (_, d)) in COMPASS.iter().enumerate() {
+                let len = d.0.hypot(d.1);
+                let spot = (v.x + d.0 / len * reach, v.y + d.1 / len * reach);
+                let mut c = cap;
+                for &(a, b) in &segments {
+                    c = c.min(segment_distance(spot, a, b));
+                }
+                for u in vs.iter().filter(|u| u.id != v.id) {
+                    c = c.min((spot.0 - u.x).hypot(spot.1 - u.y));
+                }
+                clearances[i] = c;
+                let score = c / cap + 0.1 * (d.0 * out.0 + d.1 * out.1) / len / out_norm;
+                if score > best_score + 1e-9 {
+                    (best, best_score) = (i, score);
+                }
+            }
+            first.push(best);
+            clear.push(clearances);
+        }
+        // Consistency: rows share n/s labels and columns share e/w labels when
+        // the shared direction is fully clear for this vertex.
+        let (north, east, south, west) = (0, 2, 4, 6);
+        vs.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut votes = [0usize; 8];
+                for (j, u) in vs.iter().enumerate() {
+                    let d = first[j];
+                    if j != i
+                        && (((u.y - v.y).abs() < 1e-9 && (d == north || d == south))
+                            || ((u.x - v.x).abs() < 1e-9 && (d == east || d == west)))
+                    {
+                        votes[d] += 1;
+                    }
+                }
+                let mut pick = first[i];
+                for k in 0..8 {
+                    if clear[i][k] >= reach - 1e-9 && votes[k] > votes[pick] {
+                        pick = k;
+                    }
+                }
+                (v.id, pick)
+            })
+            .collect()
     }
 }
 
@@ -305,5 +499,30 @@ mod tests {
         history.checkpoint(&graph);
         graph.add_vertex(2.0, 0.0);
         assert!(!history.redo(&mut graph));
+    }
+
+    #[test]
+    fn label_directions_match_typst_rule() {
+        // A binary tree: labels share the row below; the apex label goes north.
+        let mut graph = Graph::default();
+        let pts = [
+            (3., 1.),
+            (0., 0.),
+            (1., 0.),
+            (2., 0.),
+            (3., 0.),
+            (4., 0.),
+            (5., 0.),
+            (6., 0.),
+        ];
+        for (x, y) in pts {
+            graph.add_vertex(x, y);
+        }
+        for (a, b) in [(2, 3), (3, 4), (4, 1), (1, 7), (7, 8), (1, 5), (6, 7)] {
+            graph.connect(a, b);
+        }
+        let dirs = graph.label_directions(LABEL_REACH, LABEL_CAP);
+        assert_eq!(COMPASS[dirs[&1]].0, "n");
+        assert!((2..=8).all(|id| COMPASS[dirs[&id]].0 == "s"));
     }
 }

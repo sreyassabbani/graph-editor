@@ -25,6 +25,7 @@ impl App {
         let mut last_frame = Instant::now() - FRAME_INTERVAL;
         loop {
             self.dirty |= self.renderer.ready();
+            self.dirty |= self.expire_status();
             if self.dirty && last_frame.elapsed() >= FRAME_INTERVAL {
                 // Measure start-to-start; expensive work must not add another
                 // fixed frame interval after it finishes.
@@ -49,7 +50,9 @@ impl App {
             } else if self.renderer.busy() {
                 Some(FRAME_INTERVAL)
             } else {
-                None
+                // Wake to clear an operation result.
+                self.status_at
+                    .map(|at| STATUS_TTL.saturating_sub(at.elapsed()))
             };
             if let Some(wait) = wait {
                 if !event::poll(wait)? {
@@ -74,6 +77,17 @@ impl App {
         }
     }
 
+    /// Clear an operation result after [`STATUS_TTL`]; true if it changed.
+    /// A pending quit confirmation stays until answered.
+    pub(super) fn expire_status(&mut self) -> bool {
+        if self.quit_pending || !self.status_at.is_some_and(|at| at.elapsed() >= STATUS_TTL) {
+            return false;
+        }
+        self.status.clear();
+        self.status_at = None;
+        true
+    }
+
     fn handle_event(&mut self, event: Event) -> bool {
         // Pure pointer motion cannot change graph geometry or the camera.
         // Keep its hot path independent of graph size and snapshot allocation.
@@ -85,9 +99,9 @@ impl App {
                 }
             }
             Event::Mouse(m) => {
-                let previous = self.hover;
+                let previous = (self.hover, self.toolbar_hover);
                 self.mouse(m);
-                if m.kind == MouseEventKind::Moved && previous == self.hover {
+                if m.kind == MouseEventKind::Moved && previous == (self.hover, self.toolbar_hover) {
                     return false;
                 }
             }

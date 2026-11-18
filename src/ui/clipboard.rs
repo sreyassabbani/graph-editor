@@ -24,6 +24,6 @@ pub(super) fn copy_to_clipboard(code: &str) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = code;
-        anyhow::bail!("clipboard currently supports macOS; save Fletcher to a file instead")
+        anyhow::bail!("clipboard currently supports macOS only")
     }
 }

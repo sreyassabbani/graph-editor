@@ -2,6 +2,8 @@
 name = "graph-editor"
 version = "0.1.0"
 edition = "2021"
+description = "Mouse-first terminal graph editor that exports Typst/Fletcher drawings"
+repository = "https://github.com/sreyassabbani/graph-editor"
 
 [dependencies]
 anyhow = "1"
@@ -10,4 +12,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui = "0.29"
 ratatui-image = { version = "4.2", default-features = false, features = ["crossterm"] }
 base64 = "0.21"
+fdeflate = "0.3"
+miniz_oxide = "0.8"
+libc = "0.2"
 resvg = { version = "0.49", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }

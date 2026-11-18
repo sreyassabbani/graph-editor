@@ -1,8 +1,8 @@
 # Graph editor design
 
 A mouse-first terminal graph-theory editor whose output is readable Fletcher
-Typst code. Start a fresh in-memory canvas with `just graph`; copy the code or
-save a `.typ` file. No project format, JSON persistence, or file reopening.
+Typst code. Start a fresh in-memory canvas with `cargo run --release`; copy the
+code to the clipboard. No file output, project format, JSON persistence, or file reopening.
 
 ## Interaction
 
@@ -12,6 +12,15 @@ vertex. Click two vertices to connect. Drag vertices to move continuously, snap
 on release, and reject occupied destinations. Right/middle-drag pans. Selected
 vertices expose label/style/delete actions in the same toolbar row. Double-click
 cycles dot/circle/plain styles. Keyboard shortcuts supplement mouse actions.
+Click near an edge segment to select it; highlight the selected edge and remove
+it with Backspace/Delete. Use endpoint IDs for edge selection, never a mutable
+vector index. Prefer vertex hits near endpoints and select the nearest edge
+within a terminal-cell-sized tolerance. Escape deselects an edge.
+
+Undo uses Cmd-Z/Ctrl-Z/`u`; redo uses Cmd-Shift-Z/Ctrl-Shift-Z/Ctrl-Y/Ctrl-R/`U`.
+Keyboard and toolbar history share the same path, clearing unfinished connection
+gestures and invalid selections. Text fields keep editing keys local. Enable
+enhanced keyboard reporting for Cmd modifiers and restore it on exit.
 
 Stable vertex IDs are separate from labels. Reject loops and duplicate edges;
 deleting a vertex removes incident edges. A completed drag is one undo step;
@@ -20,16 +29,17 @@ camera transform for drawing and hit testing. Labels remain literal text.
 
 ## Rendering
 
-Transparent background; Frappé colors match the user's Ghostty/Rex configuration.
+Transparent background; Catppuccin Frappé colors.
 Ratatui owns UI text and the event loop. Describe graph geometry as SVG;
-resvg/usvg own rasterization, font discovery, shaping, measurement, masking and
-compositing. Render at the terminal's native pixel dimensions. Never enlarge a
+resvg/usvg own rasterization, font discovery, shaping, measurement and
+compositing. Edges are clipped geometrically around circle nodes and plain
+labels (no SVG masks); grid dots are blended from small antialiased sprites. Render at the terminal's native pixel dimensions. Never enlarge a
 reduced-resolution preview or implement a font renderer. Kitty terminals receive
-compressed PNGs placed in explicit cell rectangles. Preserve alpha, including
-node interiors that mask incident edges. Keep the small transport adapter isolated
+zlib-compressed raw RGBA (`f=32,o=z`) placed in explicit cell rectangles.
+Preserve alpha, including node interiors that edges stop short of. Keep the small transport adapter isolated
 in `ui/graphics.rs`; other protocols retain the ratatui-image fallback.
 
-Keep expensive rendering and PNG/Kitty encoding on a single background worker.
+Keep expensive rendering and Kitty encoding on a single background worker.
 Allow one active scene, one replaceable pending scene, and one latest completed
 frame. Present completed frames during continuous gestures so a stream of input
 cannot starve drawing. Never replay a queue of obsolete render requests. Reject
@@ -50,15 +60,19 @@ measurements; native pinch is terminal-dependent.
 
 ## Export and validation
 
-Export a direct `#context diagram(...)` fragment, assuming `diagram`, `node` and
-`edge` are in scope. No imports, helper functions or named drawing wrapper.
-Put shared styles at the diagram level, keep one call per line, and use short
-compass offsets for labels. Copy and Save produce identical fragments. Preserve
-isolated vertices, positions, styles, Unicode and literal labels. Every component
-inherits surrounding Typst text color. Save atomically; confirm existing-file overwrite.
+Export a compact `#graph(vertices: (...), edges: (...))` IR. Each vertex row is
+`id: (x, y, label[, style])`. Keep IDs independent of visible labels; annotate
+only mixed-style exceptions, and put uniform styles at graph level. Assume
+`graph` is imported from the bundled `typst/graph.typ` (directly or re-exported
+by a template).
+The portable helper owns Fletcher imports, contextual ink, label placement and
+styling. Preserve the older graph constructor/paths/positions APIs too.
+Preserve isolated vertices, positions, styles, Unicode and literal labels.
+Compile exports through the bundled helper, including mixed/uniform styles in
+normal and blue text.
 
-Follow the module boundaries in README.md. Run `just graph-check` in the direnv
-shell, including full-pane sizing/resize, transparency, protocol framing, graph
-invariants, gesture history/cancellation, save dialogs and compilation in normal
-and blue text. The user tests interactive behavior; do not manually drive Rex
-or access the clipboard for verification. Preserve unrelated homework changes.
+Follow the module boundaries in README.md. Run `cargo test`, covering
+full-pane sizing/resize, transparency, protocol framing, graph invariants,
+gesture history/cancellation and compilation in normal and blue text.
+Interactive behavior is tested by hand; automated tests do not touch the
+clipboard.

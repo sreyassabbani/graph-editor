@@ -1,19 +1,20 @@
 //! One render worker, with one replaceable pending scene. Input never waits for
-//! SVG parsing, font shaping, rasterization, PNG compression or base64 encoding.
+//! SVG parsing, font shaping, rasterization, compression or frame transport.
 //! Completed frames stay available during continuous gestures; pending work is
 //! replaced by the latest scene, so slow rendering cannot build an input backlog.
 use super::*;
 use std::sync::{Arc, Condvar, Mutex};
 
 pub(super) enum Frame {
-    Kitty(String),
+    Kitty(graphics::KittyFrame),
     Image(image::DynamicImage),
 }
 
 struct Job {
     scene: canvas::Scene,
     area: Rect,
-    kitty: bool,
+    /// Kitty transport; `None` for other graphics protocols.
+    kitty: Option<graphics::Transport>,
 }
 
 #[derive(Default)]
@@ -65,7 +66,12 @@ impl Renderer {
         Self { shared }
     }
 
-    pub(super) fn submit(&self, scene: canvas::Scene, area: Rect, kitty: bool) {
+    pub(super) fn submit(
+        &self,
+        scene: canvas::Scene,
+        area: Rect,
+        kitty: Option<graphics::Transport>,
+    ) {
         let mut mailbox = self.shared.0.lock().unwrap();
         mailbox.next = Some(Job { scene, area, kitty });
         self.shared.1.notify_one();
@@ -97,13 +103,17 @@ mod tests {
             let id = job.scene.state.graph.next_id;
             started_tx.send(id).unwrap();
             release_rx.recv().unwrap();
-            Ok(Frame::Kitty(id.to_string()))
+            Ok(Frame::Kitty(graphics::KittyFrame {
+                upload: id.to_string(),
+                camera: job.scene.state.camera,
+                margin: (0, 0),
+            }))
         });
         let app = super::super::test_support::app();
         let submit = |id| {
             let mut scene = app.scene();
             scene.state.graph.next_id = id;
-            renderer.submit(scene, app.area, true);
+            renderer.submit(scene, app.area, Some(graphics::Transport::Inline));
         };
         submit(1);
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
@@ -114,7 +124,7 @@ mod tests {
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
         // Continuous input must not starve presentation of completed frames.
         let (_, frame) = renderer.take().unwrap();
-        assert!(matches!(frame.unwrap(), Frame::Kitty(s) if s == "1"));
+        assert!(matches!(frame.unwrap(), Frame::Kitty(f) if f.upload == "1"));
         assert!(renderer.busy());
         release_tx.send(()).unwrap();
         let mailbox = renderer.shared.0.lock().unwrap();
@@ -130,7 +140,7 @@ mod tests {
             "completed frames must prevent a blocking input wait"
         );
         let (_, frame) = renderer.take().unwrap();
-        assert!(matches!(frame.unwrap(), Frame::Kitty(s) if s == "3"));
+        assert!(matches!(frame.unwrap(), Frame::Kitty(f) if f.upload == "3"));
         assert!(!renderer.busy());
     }
 }
@@ -146,14 +156,17 @@ impl Drop for Renderer {
 
 fn render(job: &Job) -> Result<Frame> {
     let pix = job.scene.render()?;
-    let png = pix.encode_png()?;
-    if job.kitty {
-        Ok(Frame::Kitty(graphics::encode(
-            &png,
-            job.area,
-            graphics::is_tmux(),
-        )))
+    if let Some(transport) = job.kitty {
+        Ok(Frame::Kitty(graphics::KittyFrame {
+            upload: graphics::encode_frame(pix, transport, graphics::is_tmux())?,
+            camera: job.scene.state.camera,
+            margin: job.scene.margin,
+        }))
     } else {
-        Ok(Frame::Image(image::load_from_memory(&png)?))
+        let (width, height) = (pix.width(), pix.height());
+        let rgba = graphics::unpremultiply(pix);
+        let image =
+            image::RgbaImage::from_raw(width, height, rgba).context("canvas pixel buffer")?;
+        Ok(Frame::Image(image.into()))
     }
 }

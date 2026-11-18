@@ -1,10 +1,8 @@
 use std::fmt::Write as _;
-use std::path::Path;
 
 use anyhow::Result;
 
-use crate::core::{Graph, Vertex, VertexStyle};
-use crate::fileio::atomic_write;
+use crate::core::{Graph, VertexStyle};
 
 // Typst strings are literal text; never place user labels in markup or math mode.
 fn typst_string(value: &str) -> String {
@@ -26,97 +24,57 @@ fn typst_string(value: &str) -> String {
     out
 }
 
-// This is a pasteable fragment. Fletcher's diagram/node/edge are already in
-// scope; keep imports, helpers and document-specific wrappers out of the output.
+// Pasteable graph IR. The shared `graph` helper owns all Fletcher details.
+// Stable IDs are independent of labels and survive edits/deleted vertices.
 pub fn export_typst(graph: &Graph) -> Result<String> {
     graph.validate().map_err(anyhow::Error::msg)?;
     if graph.vertices.is_empty() {
         return Ok(String::new());
     }
-    let dots_only = graph.vertices.iter().all(|v| v.style == VertexStyle::Dots);
-    let mut out = String::from("#context diagram(\n  axes: (ltr, btt), cell-size: 12mm, spacing: 0pt,\n  node-inset: 0pt, edge-stroke: 0.7pt + text.fill,\n");
-    if dots_only {
-        out.push_str("  node-fill: text.fill,\n");
-    }
-    out.push('\n');
-    for v in &graph.vertices {
-        write_vertex(&mut out, v, dots_only);
-    }
-    let labelled_dots: Vec<_> = graph
+    let mut out = String::from("#graph(\n  vertices: (\n");
+    // Put a uniform style at graph level; mixed graphs only annotate exceptions.
+    let style = if graph
         .vertices
         .iter()
-        .filter(|v| v.style == VertexStyle::Dots && !v.label.is_empty())
-        .collect();
-    if !labelled_dots.is_empty() {
-        // Normalize before finding the centroid to avoid overflow for finite,
-        // extreme coordinates. Only label direction depends on the centroid.
-        let scale = graph
-            .vertices
-            .iter()
-            .fold(1_f64, |s, v| s.max(v.x.abs()).max(v.y.abs()));
-        let count = graph.vertices.len() as f64;
-        let cx = graph
-            .vertices
-            .iter()
-            .map(|v| v.x / scale / count)
-            .sum::<f64>();
-        let cy = graph
-            .vertices
-            .iter()
-            .map(|v| v.y / scale / count)
-            .sum::<f64>();
-        let horizontal = graph
-            .vertices
-            .iter()
-            .all(|v| (v.y / scale - cy).abs() < 0.001 / scale);
-        out.push('\n');
-        for v in labelled_dots {
-            let (dx, dy) = label_offset(v.x / scale - cx, v.y / scale - cy, horizontal);
-            let fill = if dots_only { ", fill: none" } else { "" };
-            writeln!(
-                out,
-                "  node((rel: ({dx}pt, {dy}pt), to: <v{}>), {}, snap: false{fill}),",
-                v.id,
-                content(&v.label)
-            )
-            .unwrap();
-        }
+        .all(|v| v.style == graph.vertices[0].style)
+    {
+        graph.vertices[0].style
+    } else {
+        VertexStyle::Dots
+    };
+    for v in &graph.vertices {
+        let override_style = if v.style == style {
+            String::new()
+        } else {
+            format!(", \"{}\"", style_name(v.style))
+        };
+        writeln!(
+            out,
+            "    v{}: ({}, {}, {}{override_style}),",
+            v.id,
+            v.x,
+            v.y,
+            content(&v.label)
+        )
+        .unwrap();
     }
+    out.push_str("  ),\n");
     if !graph.edges.is_empty() {
-        out.push('\n');
+        out.push_str("  edges: (\n");
+        for edge in &graph.edges {
+            writeln!(out, "    (\"v{}\", \"v{}\"),", edge.a, edge.b).unwrap();
+        }
+        out.push_str("  ),\n");
     }
-    for edge in &graph.edges {
-        writeln!(out, "  edge(<v{}>, <v{}>),", edge.a, edge.b).unwrap();
+    if style != VertexStyle::Dots {
+        writeln!(out, "  style: \"{}\",", style_name(style)).unwrap();
     }
     out.push_str(")\n");
     Ok(out)
 }
 
-fn write_vertex(out: &mut String, v: &Vertex, dots_only: bool) {
-    let position = format!("({}, {})", v.x, v.y);
-    match v.style {
-        VertexStyle::Dots => {
-            let fill = if dots_only { "" } else { ", fill: text.fill" };
-            writeln!(
-                out,
-                "  node({position}, name: <v{}>, radius: 1.8pt{fill}),",
-                v.id
-            )
-            .unwrap();
-        }
-        VertexStyle::Circles => {
-            writeln!(out, "  node({position}, {}, name: <v{}>, radius: 10pt, inset: 3pt, stroke: 0.7pt + text.fill),", content(&v.label), v.id).unwrap();
-        }
-        VertexStyle::Plain => {
-            writeln!(
-                out,
-                "  node({position}, {}, name: <v{}>, inset: 3pt),",
-                content(&v.label),
-                v.id
-            )
-            .unwrap();
-        }
-    }
+fn style_name(style: VertexStyle) -> &'static str {
+    style.name()
 }
 
 // Keep ordinary labels readable. Complex strings use text() so literal markup,
@@ -130,29 +88,6 @@ fn content(label: &str) -> String {
     } else {
         format!("text({})", typst_string(label))
     }
-}
-
-fn label_offset(dx: f64, dy: f64, horizontal: bool) -> (i8, i8) {
-    if horizontal {
-        return (0, 9);
-    }
-    if dx == 0. && dy == 0. {
-        return (9, 0);
-    }
-    let sx = if dx < 0. { -1 } else { 1 };
-    let sy = if dy < 0. { -1 } else { 1 };
-    let threshold = (std::f64::consts::PI / 8.).tan();
-    if dy.abs() <= dx.abs() * threshold {
-        (sx * 9, 0)
-    } else if dx.abs() <= dy.abs() * threshold {
-        (0, sy * 9)
-    } else {
-        (sx * 6, sy * 6)
-    }
-}
-
-pub fn write_typst(path: &Path, graph: &Graph) -> Result<()> {
-    atomic_write(path, export_typst(graph)?.as_bytes())
 }
 
 #[cfg(test)]
@@ -169,30 +104,36 @@ mod tests {
         graph.vertices[2].style = VertexStyle::Plain;
         graph.connect(1, 2);
         let output = export_typst(&graph).unwrap();
-        assert!(output.starts_with("#context diagram("));
-        assert!(output.contains("text(\"quote \\\" slash \\\\ $x$ #evil\\n雪\")"));
-        assert!(output.contains("node((1, 2), [2], name: <v2>"));
-        assert!(output.contains("node((2, 0), [3], name: <v3>"));
-        assert!(output.contains("edge(<v1>, <v2>)"));
-        for boilerplate in ["#import", "#let", "fletcher.", "#drawing"] {
+        assert!(output.starts_with("#graph("));
+        assert!(output.contains(r#"text("quote \" slash \\ $x$ #evil\n雪")"#));
+        assert!(output.contains("v2: (1, 2, [2], \"circles\")"));
+        assert!(output.contains("v3: (2, 0, [3], \"plain\")"));
+        assert!(output.contains("(\"v1\", \"v2\")"));
+        for boilerplate in [
+            "#import",
+            "#let",
+            "fletcher.",
+            "context",
+            "node(",
+            "edge(",
+            "pt",
+            "text.fill",
+        ] {
             assert!(!output.contains(boilerplate));
         }
     }
     #[test]
-    fn example_uses_short_outward_label_offsets() {
+    fn compact_ir_preserves_sparse_ids_and_uniform_style() {
         let mut graph = Graph::default();
         graph.add_vertex(-2., 2.);
         graph.add_vertex(-4., 5.);
         graph.add_vertex(1., 4.);
-        graph.connect(1, 2);
+        graph.remove_vertex(2);
         graph.connect(3, 1);
-        graph.connect(2, 3);
-        let output = export_typst(&graph).unwrap();
-        assert!(output.contains("rel: (0pt, -9pt)"));
-        assert!(output.contains("rel: (-6pt, 6pt)"));
-        assert!(output.contains("rel: (9pt, 0pt)"));
-        assert_eq!(output.matches("node-fill: text.fill").count(), 1);
-        assert!(output.lines().count() < 22);
+        for v in &mut graph.vertices {
+            v.style = VertexStyle::Circles;
+        }
+        assert_eq!(export_typst(&graph).unwrap(), "#graph(\n  vertices: (\n    v1: (-2, 2, [1]),\n    v3: (1, 4, [3]),\n  ),\n  edges: (\n    (\"v3\", \"v1\"),\n  ),\n  style: \"circles\",\n)\n");
     }
     #[test]
     fn empty_graph_is_empty_content() {

@@ -12,13 +12,21 @@ impl Drop for Scratch {
     }
 }
 
-// Compile actual export output away from the repository: a hidden dependency on a
-// local helper must not pass. Run this in the project's Nix/direnv shell.
+// Compile the actual Copy IR against the bundled `typst/graph.typ` helper,
+// in a scratch directory, in normal and coloured surrounding text. Needs
+// `typst` on PATH (and network access the first time, to fetch Fletcher);
+// skipped with a message when Typst is not installed.
 #[test]
-fn exports_fletcher_fragments_that_inherit_text_color() {
+fn graph_ir_compiles_with_bundled_helper_in_surrounding_color() {
+    if Command::new("typst").arg("--version").output().is_err() {
+        eprintln!("skipping: `typst` is not on PATH");
+        return;
+    }
     let scratch =
         Scratch(std::env::temp_dir().join(format!("fletcher-export-{}", std::process::id())));
     fs::create_dir(&scratch.0).unwrap();
+    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("typst/graph.typ");
+    fs::copy(helper, scratch.0.join("graph.typ")).unwrap();
     let mut graph = Graph::default();
     graph.add_vertex(-1., 1.);
     graph.add_vertex(1., 1.);
@@ -33,32 +41,47 @@ fn exports_fletcher_fragments_that_inherit_text_color() {
     for vertex in &mut dots.vertices {
         vertex.style = VertexStyle::Dots;
     }
-    for (case, graph) in [("mixed", graph), ("dots", dots)] {
+    let mut circles = dots.clone();
+    let mut plain = dots.clone();
+    for vertex in &mut circles.vertices {
+        vertex.style = VertexStyle::Circles;
+    }
+    for vertex in &mut plain.vertices {
+        vertex.style = VertexStyle::Plain;
+    }
+    for (case, graph) in [
+        ("mixed", graph),
+        ("dots", dots),
+        ("circles", circles),
+        ("plain", plain),
+    ] {
         let module = export::export_typst(&graph).unwrap();
-        assert!(module.contains("#context diagram("));
-        assert!(module.contains("name: <v4>"));
-        for (name, color) in [("normal", "#000000"), ("blue", "#007bff")] {
-            let input = scratch.0.join(format!("{case}-{name}.typ"));
-            let svg = scratch.0.join(format!("{case}-{name}.svg"));
-            fs::write(&input, format!("#import \"@preview/fletcher:0.5.8\": diagram, node, edge\n#set page(width: auto, height: auto, margin: 5mm)\n#text(fill: rgb(\"{color}\"))[\n{module}\n]\n")).unwrap();
-            let compiled = Command::new("typst")
-                .arg("compile")
-                .arg(&input)
-                .arg(&svg)
-                .output()
-                .expect("run tests in the Nix/direnv shell, which provides Typst");
-            assert!(
-                compiled.status.success(),
-                "{}",
-                String::from_utf8_lossy(&compiled.stderr)
-            );
-            let svg = fs::read_to_string(svg).unwrap();
-            assert!(
-                svg.contains(color),
-                "export did not use surrounding text color {color}"
-            );
-            if name == "blue" {
-                assert!(!svg.contains("#000000"), "export contains fixed black ink");
+        assert!(module.contains("#graph("));
+        assert!(module.contains("v4: (3, 0, [4])"));
+        for (import_name, import) in [("helper", "#import \"graph.typ\": graph")] {
+            for (name, color) in [("normal", "#000000"), ("blue", "#007bff")] {
+                let input = scratch.0.join(format!("{case}-{import_name}-{name}.typ"));
+                let svg = scratch.0.join(format!("{case}-{import_name}-{name}.svg"));
+                fs::write(&input, format!("{import}\n#set page(width: auto, height: auto, margin: 5mm)\n#text(fill: rgb(\"{color}\"))[\n{module}\n]\n")).unwrap();
+                let compiled = Command::new("typst")
+                    .arg("compile")
+                    .arg(&input)
+                    .arg(&svg)
+                    .output()
+                    .expect("running typst");
+                assert!(
+                    compiled.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&compiled.stderr)
+                );
+                let svg = fs::read_to_string(svg).unwrap();
+                assert!(
+                    svg.contains(color),
+                    "export did not use surrounding text color {color}"
+                );
+                if name == "blue" {
+                    assert!(!svg.contains("#000000"), "export contains fixed black ink");
+                }
             }
         }
     }

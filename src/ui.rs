@@ -3,20 +3,23 @@ mod clipboard;
 mod events;
 mod graphics;
 mod input;
+mod mouse;
 mod output;
+mod prefs;
 mod renderer;
 mod theme;
 mod view;
 
 use crate::{
-    core::{Camera, Graph, History, VertexStyle},
+    core::{Camera, Edge, Graph, History, VertexStyle},
     export,
 };
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -37,23 +40,109 @@ use ratatui_image::{
 use resvg::tiny_skia::Pixmap;
 use std::{
     io::{self, stdout},
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
 enum Drag {
-    Vertex {
-        id: u64,
+    /// Dragging `anchor` moves every vertex in `ids` (the selection) together.
+    Vertices {
+        anchor: u64,
+        ids: Vec<u64>,
         original: Graph,
         offset: (f64, f64),
         moved: bool,
+        /// A plain click on a member of a multi-selection narrows it to that vertex.
+        narrow: bool,
+    },
+    /// Rubber-band selection in screen coordinates.
+    Marquee {
+        start: (f64, f64),
+        end: (f64, f64),
+        additive: bool,
     },
     Pan(f64, f64),
 }
 
-struct PathPrompt {
-    input: String,
-    overwrite: bool,
+/// Selected vertices and edges. Bulk actions (style, delete, connect, move)
+/// apply to all of them; a single selected vertex is also the label target.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Selection {
+    pub vertices: Vec<u64>,
+    pub edges: Vec<Edge>,
+}
+
+fn same_edge(a: &Edge, b: &Edge) -> bool {
+    (a.a == b.a && a.b == b.b) || (a.a == b.b && a.b == b.a)
+}
+
+impl Selection {
+    pub fn vertex(id: u64) -> Self {
+        Self {
+            vertices: vec![id],
+            edges: Vec::new(),
+        }
+    }
+    pub fn edge(edge: Edge) -> Self {
+        Self {
+            vertices: Vec::new(),
+            edges: vec![edge],
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty() && self.edges.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.vertices.len() + self.edges.len()
+    }
+    pub fn has_vertex(&self, id: u64) -> bool {
+        self.vertices.contains(&id)
+    }
+    pub fn has_edge(&self, edge: &Edge) -> bool {
+        self.edges.iter().any(|e| same_edge(e, edge))
+    }
+    pub fn toggle_vertex(&mut self, id: u64) {
+        if self.has_vertex(id) {
+            self.vertices.retain(|&v| v != id);
+        } else {
+            self.vertices.push(id);
+        }
+    }
+    pub fn toggle_edge(&mut self, edge: Edge) {
+        if self.has_edge(&edge) {
+            self.edges.retain(|e| !same_edge(e, &edge));
+        } else {
+            self.edges.push(edge);
+        }
+    }
+    pub fn extend(&mut self, other: Selection) {
+        for id in other.vertices {
+            if !self.has_vertex(id) {
+                self.vertices.push(id);
+            }
+        }
+        for edge in other.edges {
+            if !self.has_edge(&edge) {
+                self.edges.push(edge);
+            }
+        }
+    }
+    /// Drop anything that no longer exists (after undo, delete, ...).
+    pub fn retain_existing(&mut self, graph: &Graph) {
+        self.vertices.retain(|&id| graph.vertex(id).is_some());
+        self.edges
+            .retain(|edge| graph.edges.iter().any(|e| same_edge(e, edge)));
+    }
+    pub fn describe(&self) -> String {
+        let count =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let vertices = count(self.vertices.len(), "vertex", "vertices");
+        let edges = count(self.edges.len(), "edge", "edges");
+        match (self.vertices.len(), self.edges.len()) {
+            (_, 0) => vertices,
+            (0, _) => edges,
+            _ => format!("{vertices}, {edges}"),
+        }
+    }
 }
 
 // Scene snapshots cross the worker boundary. Hover is a separate Kitty layer.
@@ -61,9 +150,11 @@ struct PathPrompt {
 struct CanvasState {
     graph: Graph,
     camera: Camera,
-    selected: Option<u64>,
+    selection: Selection,
     edge_start: Option<u64>,
     hover: Option<(f64, f64)>,
+    /// Rubber-band rectangle (two screen-space corners) while dragging one.
+    marquee: Option<((f64, f64), (f64, f64))>,
     size: (u32, u32),
 }
 
@@ -71,16 +162,22 @@ struct App {
     graph: Graph,
     camera: Camera,
     history: History,
-    export_path: Option<PathBuf>,
-    path_prompt: Option<PathPrompt>,
+    /// Style given to newly placed vertices; follows the last style change.
+    new_style: VertexStyle,
+    /// New vertices get no label; set by clearing a label.
+    new_unlabeled: bool,
     delivered: Option<Graph>,
-    selected: Option<u64>,
+    selection: Selection,
     edge_start: Option<u64>,
     hover: Option<(f64, f64)>,
     drag: Option<Drag>,
     last_click: Option<(u64, Instant)>,
     editing: Option<String>,
     status: String,
+    /// When `status` was set; results clear themselves after [`STATUS_TTL`].
+    status_at: Option<Instant>,
+    /// Toolbar column under the pointer, for button highlighting.
+    toolbar_hover: Option<u16>,
     area: Rect,
     cell: (f64, f64),
     picker: Picker,
@@ -92,25 +189,43 @@ struct App {
     canvas_state: Option<CanvasState>,
     protocol: Option<StatefulProtocol>,
     fit_on_open: bool,
+    /// The terminal reports mouse positions in pixels (SGR-Pixels, mode 1016)
+    /// rather than cells, so pans and drags move smoothly.
+    pixel_mouse: bool,
+    /// How Kitty frames reach the terminal; shared memory when it says so.
+    transport: graphics::Transport,
 }
 
-struct TerminalGuard;
+/// How long an operation result stays in the status row.
+const STATUS_TTL: Duration = Duration::from_secs(3);
+
+struct TerminalGuard {
+    keyboard_enhanced: bool,
+}
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.keyboard_enhanced {
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             stdout(),
             crossterm::terminal::EndSynchronizedUpdate,
             crossterm::style::Print(graphics::cleanup()),
+            crossterm::style::Print("\x1b[?1016l"),
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        graphics::shm::unlink_all();
     }
 }
 
 pub fn run() -> Result<()> {
+    canvas::preload_fonts();
     // Query in the alternate screen, before crossterm owns input.
-    let guard = TerminalGuard;
+    let mut guard = TerminalGuard {
+        keyboard_enhanced: false,
+    };
     execute!(stdout(), EnterAlternateScreen)?;
     let picker =
         Picker::from_query_stdio().context("could not query terminal graphics capabilities")?;
@@ -122,10 +237,32 @@ pub fn run() -> Result<()> {
         anyhow::bail!("Terminal did not report a usable cell pixel size");
     }
     enable_raw_mode()?;
-    execute!(stdout(), EnableMouseCapture)?;
+    let capabilities = mouse::probe(picker.protocol_type() == ProtocolType::Kitty);
+    let pixel_mouse = capabilities.pixel_mouse;
+    execute!(
+        stdout(),
+        EnableMouseCapture,
+        crossterm::style::Print(if pixel_mouse { "\x1b[?1016h" } else { "" }),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    )?;
+    guard.keyboard_enhanced = true;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut app = App::new(Graph::default(), picker);
+    app.pixel_mouse = pixel_mouse;
+    if capabilities.shared_memory {
+        app.transport = graphics::Transport::SharedMemory;
+    }
+    let preferences = prefs::path();
+    if let Some(path) = &preferences {
+        prefs::load(&mut app, path);
+    }
     let result = app.event_loop(&mut terminal);
+    if let Some(path) = &preferences {
+        prefs::save(&app, path);
+    }
     let _ = terminal.show_cursor();
     drop(guard);
     result
@@ -142,19 +279,24 @@ impl App {
         let cell = (physical.0 as f64 * scale, physical.1 as f64 * scale);
         Self {
             quit_pending: false,
+            new_style: graph
+                .vertices
+                .last()
+                .map_or(VertexStyle::default(), |v| v.style),
+            new_unlabeled: false,
             graph,
             camera: Camera::default(),
             history: History::default(),
-            export_path: None,
-            path_prompt: None,
             delivered: None,
-            selected: None,
+            selection: Selection::default(),
             edge_start: None,
             hover: None,
             drag: None,
             last_click: None,
             editing: None,
             status: String::new(),
+            status_at: None,
+            toolbar_hover: None,
             area: Rect::default(),
             cell,
             picker,
@@ -165,6 +307,8 @@ impl App {
             canvas_state: None,
             protocol: None,
             fit_on_open: true,
+            pixel_mouse: false,
+            transport: graphics::Transport::Inline,
         }
     }
 }
