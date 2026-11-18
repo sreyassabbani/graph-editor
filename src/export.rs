@@ -52,8 +52,9 @@ pub fn export_typst(graph: &Graph) -> Result<String> {
             out,
             "    v{}: ({}, {}, {}{override_style}),",
             v.id,
-            v.x,
-            v.y,
+            // Adding 0.0 turns -0.0 (from snapping just above an axis) into 0.
+            v.x + 0.0,
+            v.y + 0.0,
             content(&v.label)
         )
         .unwrap();
@@ -134,6 +135,13 @@ mod tests {
             v.style = VertexStyle::Circles;
         }
         assert_eq!(export_typst(&graph).unwrap(), "#graph(\n  vertices: (\n    v1: (-2, 2, [1]),\n    v3: (1, 4, [3]),\n  ),\n  edges: (\n    (\"v3\", \"v1\"),\n  ),\n  style: \"circles\",\n)\n");
+    }
+    #[test]
+    fn negative_zero_coordinates_export_as_zero() {
+        let mut graph = Graph::default();
+        graph.add_vertex(-3., -0.);
+        let output = export_typst(&graph).unwrap();
+        assert!(output.contains("v1: (-3, 0, [1])"), "{output}");
     }
     #[test]
     fn empty_graph_is_empty_content() {
