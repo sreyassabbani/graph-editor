@@ -1,9 +1,9 @@
 [package]
-name = "graph-editor"
+name = "petersen"
 version = "0.1.0"
 edition = "2021"
 description = "Mouse-first terminal graph editor that exports Typst/Fletcher drawings"
-repository = "https://github.com/sreyassabbani/graph-editor"
+repository = "https://github.com/sreyassabbani/petersen"
 
 [dependencies]
 anyhow = "1"

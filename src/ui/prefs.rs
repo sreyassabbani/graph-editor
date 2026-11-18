@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub(super) fn path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/state/graph-editor/defaults"))
+    Some(PathBuf::from(home).join(".local/state/petersen/defaults"))
 }
 
 /// Unknown keys and malformed lines are ignored.

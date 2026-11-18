@@ -297,7 +297,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "graph-editor"
+name = "petersen"
 version = "0.1.0"
 dependencies = [
  "anyhow",

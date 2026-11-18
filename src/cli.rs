@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 
-pub const USAGE: &str = "Usage: graph-editor [--help]";
+pub const USAGE: &str = "Usage: petersen [--help]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {

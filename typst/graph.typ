@@ -48,7 +48,7 @@
   calc.sqrt(calc.pow(p.at(0) - a.at(0) - t * dx, 2) + calc.pow(p.at(1) - a.at(1) - t * dy, 2))
 }
 
-// Automatic label placement; the graph editor's src/core.rs mirrors this rule.
+// Automatic label placement; petersen's src/core.rs mirrors this rule.
 // 1. Each label tries eight compass spots at distance `reach`. Score: clearance
 //    from every edge and other vertex (saturating at `cap`), plus a small bonus
 //    for pointing away from the drawing's center.

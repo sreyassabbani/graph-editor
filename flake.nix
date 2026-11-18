@@ -17,7 +17,7 @@
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "graph-editor";
+          pname = "petersen";
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = pkgs.lib.fileset.toSource {
             root = ./.;
@@ -35,8 +35,8 @@
           doCheck = false;
           meta = {
             description = "Mouse-first terminal graph editor that exports Typst/Fletcher drawings";
-            homepage = "https://github.com/sreyassabbani/graph-editor";
-            mainProgram = "graph-editor";
+            homepage = "https://github.com/sreyassabbani/petersen";
+            mainProgram = "petersen";
           };
         };
       });

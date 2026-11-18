@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, process::Command};
 
-use graph_editor::{
+use petersen::{
     core::{Graph, VertexStyle},
     export,
 };

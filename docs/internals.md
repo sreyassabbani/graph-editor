@@ -51,7 +51,7 @@ the editor runs, so Cmd shortcuts reach it; it's restored on exit.
 | `ui/canvas.rs`, `ui/theme.rs` | SVG scene and Catppuccin Frappé colours |
 | `ui/graphics.rs` | Kitty RGBA transport and hover placement |
 | `ui/output.rs`, `ui/clipboard.rs` | Copying to the clipboard |
-| `ui/prefs.rs` | Remembered style and label mode for new vertices (`~/.local/state/graph-editor/defaults`) |
+| `ui/prefs.rs` | Remembered style and label mode for new vertices (`~/.local/state/petersen/defaults`) |
 
 ## Tests
 
