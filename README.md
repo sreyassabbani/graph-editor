@@ -6,8 +6,13 @@ with [Fletcher](https://typst.app/universe/package/fletcher) through the bundled
 `typst/graph.typ` helper.
 
 ```sh
+nix run github:sreyassabbani/graph-editor   # or, in a checkout:
 cargo run --release
 ```
+
+The flake also exposes `packages.<system>.default` for installing it (for
+example through a nix-darwin or home-manager overlay) and a dev shell with
+Rust, clippy and Typst (`nix develop`, or `use flake` via direnv).
 
 Requirements:
 

@@ -1,0 +1,67 @@
+{
+  description = "Mouse-first terminal graph editor that exports Typst/Fletcher drawings";
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+  outputs =
+    { self, nixpkgs }:
+    let
+      systems = [
+        "aarch64-darwin"
+        "x86_64-darwin"
+        "aarch64-linux"
+        "x86_64-linux"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+    in
+    {
+      packages = forAllSystems (pkgs: {
+        default = pkgs.rustPlatform.buildRustPackage {
+          pname = "graph-editor";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+              ./tests
+              ./typst
+            ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          # The tests read system fonts, create POSIX shared memory and compile
+          # Typst with network access; run `cargo test` in the dev shell instead.
+          doCheck = false;
+          meta = {
+            description = "Mouse-first terminal graph editor that exports Typst/Fletcher drawings";
+            homepage = "https://github.com/sreyassabbani/graph-editor";
+            mainProgram = "graph-editor";
+          };
+        };
+      });
+
+      apps = forAllSystems (pkgs: {
+        default = {
+          type = "app";
+          program = pkgs.lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+      });
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rust-analyzer
+            typst
+          ];
+          RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
+        };
+      });
+
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
+    };
+}
