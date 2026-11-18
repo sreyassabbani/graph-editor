@@ -1,4 +1,6 @@
 target/
 result
-.direnv/
 .DS_Store
+.devenv*
+devenv.local.nix
+devenv.local.yaml
