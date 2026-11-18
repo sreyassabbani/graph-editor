@@ -216,7 +216,10 @@ pub(super) fn render_marquee(
     fill.fill(Color::from_rgba8(r, g, b, (0.08 * 255.) as u8));
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(r, g, b, (0.8 * 255.) as u8));
-    let thickness = (scale.0.round().max(1.) as u32, scale.1.round().max(1.) as u32);
+    let thickness = (
+        scale.0.round().max(1.) as u32,
+        scale.1.round().max(1.) as u32,
+    );
     let dashes = |length: u32, step: f64, horizontal: bool| -> Result<Pixmap> {
         let (w, h) = if horizontal {
             (length, thickness.1)
@@ -503,7 +506,11 @@ impl Scene {
             };
             match v.style {
                 VertexStyle::Dots => {
-                    write!(nodes, r#"<circle cx="{x}" cy="{y}" r="{dot}" fill="{color}"/>"#).unwrap();
+                    write!(
+                        nodes,
+                        r#"<circle cx="{x}" cy="{y}" r="{dot}" fill="{color}"/>"#
+                    )
+                    .unwrap();
                 }
                 VertexStyle::Circles => {
                     holes.push(Hole::Circle((x, y), ring));
@@ -511,7 +518,11 @@ impl Scene {
                 }
                 // A plain vertex with no label is a dot, as in `typst/graph.typ`.
                 VertexStyle::Plain if v.label.is_empty() => {
-                    write!(nodes, r#"<circle cx="{x}" cy="{y}" r="{dot}" fill="{color}"/>"#).unwrap();
+                    write!(
+                        nodes,
+                        r#"<circle cx="{x}" cy="{y}" r="{dot}" fill="{color}"/>"#
+                    )
+                    .unwrap();
                 }
                 VertexStyle::Plain => {}
             }
@@ -612,8 +623,17 @@ mod tests {
         // Centered on the anchor, and the markup characters became glyphs.
         assert!(l < 0. && r > 0. && t < 0. && b > 0.);
         assert!(r - l > label_sprite("λ", 12., (2., 2.), fonts).bounds.unwrap().2 * 2.);
-        assert!(sprite.pix.as_ref().unwrap().pixels().iter().any(|p| p.alpha() > 0));
-        assert!(Rc::ptr_eq(&sprite, &label_sprite("λ<&", 12., (2., 2.), fonts)));
+        assert!(sprite
+            .pix
+            .as_ref()
+            .unwrap()
+            .pixels()
+            .iter()
+            .any(|p| p.alpha() > 0));
+        assert!(Rc::ptr_eq(
+            &sprite,
+            &label_sprite("λ<&", 12., (2., 2.), fonts)
+        ));
         assert!(label_sprite("", 12., (2., 2.), fonts).pix.is_none());
     }
     #[test]
@@ -652,35 +672,38 @@ mod tests {
         app.graph.vertex_mut(2).unwrap().style = VertexStyle::Plain;
         // A 1600x1000 canvas, and a real Retina pane (100x59 cells) at the
         // default zoom and at the densest grid zoom.
-        for transport in [graphics::Transport::Inline, graphics::Transport::SharedMemory] {
-        for (size, logical, zoom) in [
-            ((1600, 1000), (800., 500.), 48.),
-            ((1900, 2478), (760., 944.), 48.),
-            ((1900, 2478), (760., 944.), 12.),
+        for transport in [
+            graphics::Transport::Inline,
+            graphics::Transport::SharedMemory,
         ] {
-            let mut scene = app.scene();
-            scene.state.size = size;
-            scene.logical_size = logical;
-            scene.state.camera.zoom = zoom;
-            let _ = scene.render().unwrap(); // load fonts once
-            let n = 20;
-            let (mut grid, mut raster, mut encode) = (0., 0., 0.);
-            let mut bytes = 0;
-            for _ in 0..n {
-                let mut pix = Pixmap::new(size.0, size.1).unwrap();
-                let t = Instant::now();
-                scene.draw_grid(&mut pix, logical.0, logical.1);
-                grid += t.elapsed().as_secs_f64();
-                let t = Instant::now();
-                let pix = scene.render().unwrap();
-                raster += t.elapsed().as_secs_f64();
-                let t = Instant::now();
-                let frame = graphics::encode_frame(pix, transport, false).unwrap();
-                encode += t.elapsed().as_secs_f64();
-                bytes = frame.len();
-            }
-            let ms = |s: f64| s / f64::from(n) * 1000.;
-            eprintln!(
+            for (size, logical, zoom) in [
+                ((1600, 1000), (800., 500.), 48.),
+                ((1900, 2478), (760., 944.), 48.),
+                ((1900, 2478), (760., 944.), 12.),
+            ] {
+                let mut scene = app.scene();
+                scene.state.size = size;
+                scene.logical_size = logical;
+                scene.state.camera.zoom = zoom;
+                let _ = scene.render().unwrap(); // load fonts once
+                let n = 20;
+                let (mut grid, mut raster, mut encode) = (0., 0., 0.);
+                let mut bytes = 0;
+                for _ in 0..n {
+                    let mut pix = Pixmap::new(size.0, size.1).unwrap();
+                    let t = Instant::now();
+                    scene.draw_grid(&mut pix, logical.0, logical.1);
+                    grid += t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    let pix = scene.render().unwrap();
+                    raster += t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    let frame = graphics::encode_frame(pix, transport, false).unwrap();
+                    encode += t.elapsed().as_secs_f64();
+                    bytes = frame.len();
+                }
+                let ms = |s: f64| s / f64::from(n) * 1000.;
+                eprintln!(
                 "{transport:?} {}x{} zoom {zoom}: render {:.2} ms (grid {:.2}), encode {:.2} ms, {} KB sent",
                 size.0,
                 size.1,
@@ -689,7 +712,7 @@ mod tests {
                 ms(encode),
                 bytes / 1024
             );
-        }
+            }
         }
         graphics::shm::unlink_all();
     }

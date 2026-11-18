@@ -31,7 +31,11 @@ pub(super) fn save(app: &App, path: &Path) {
     let text = format!(
         "style={}\nlabels={}\n",
         app.new_style.name(),
-        if app.new_unlabeled { "none" } else { "numbered" }
+        if app.new_unlabeled {
+            "none"
+        } else {
+            "numbered"
+        }
     );
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

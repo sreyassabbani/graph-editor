@@ -297,22 +297,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "petersen"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "crossterm",
- "fdeflate",
- "image",
- "libc",
- "miniz_oxide 0.8.9",
- "ratatui",
- "ratatui-image",
- "resvg",
-]
-
-[[package]]
 name = "harfrust"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -559,6 +543,22 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "petersen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "crossterm",
+ "fdeflate",
+ "image",
+ "libc",
+ "miniz_oxide 0.8.9",
+ "ratatui",
+ "ratatui-image",
+ "resvg",
+]
 
 [[package]]
 name = "pico-args"

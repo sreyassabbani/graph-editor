@@ -43,7 +43,8 @@ pub(super) fn probe(kitty: bool) -> Capabilities {
     };
     Capabilities {
         pixel_mouse: reports_pixels(&reply),
-        shared_memory: object.is_some() && String::from_utf8_lossy(&reply).contains("\x1b_Gi=31;OK"),
+        shared_memory: object.is_some()
+            && String::from_utf8_lossy(&reply).contains("\x1b_Gi=31;OK"),
     }
 }
 

@@ -236,7 +236,8 @@ impl KittyCanvas {
                 let sprites = render(size.0, size.1)?;
                 let thickness = (sprites.horizontal.height(), sprites.vertical.width());
                 self.pending.push_str(&upload_raw(sprites.fill, ids[0]));
-                self.pending.push_str(&upload_raw(sprites.horizontal, ids[1]));
+                self.pending
+                    .push_str(&upload_raw(sprites.horizontal, ids[1]));
                 self.pending.push_str(&upload_raw(sprites.vertical, ids[2]));
                 self.marquee_sprites = Some((size, thickness));
                 thickness
@@ -250,7 +251,8 @@ impl KittyCanvas {
             (ids[2], 1, (r.left, r.top), (tv, r.height)),
             (ids[2], 2, (r.left + r.width - tv, r.top), (tv, r.height)),
         ] {
-            self.pending.push_str(&place(id, p, at, (0, 0), crop, -1, area, cell));
+            self.pending
+                .push_str(&place(id, p, at, (0, 0), crop, -1, area, cell));
         }
         self.marquee_placement = placement;
         Ok(())
@@ -382,7 +384,6 @@ fn unpremultiply_into(src: &[u8], dst: &mut [u8]) {
     let done = src.len() / BLOCK * BLOCK;
     convert(&src[done..], &mut dst[done..]);
 }
-
 
 /// How full frames reach the terminal.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -556,9 +557,17 @@ mod tests {
         assert_eq!(&raw[..4], &[100, 50, 0, 128]);
 
         let (area, cell, scale) = (Rect::new(0, 1, 8, 8), (8, 16), (2., 2.));
-        let camera = Camera { x: 0., y: 0., zoom: 10. };
+        let camera = Camera {
+            x: 0.,
+            y: 0.,
+            zoom: 10.,
+        };
         let mut canvas = KittyCanvas::new();
-        canvas.stage_frame(KittyFrame { upload: "UPLOAD".into(), camera, margin: (20, 20) });
+        canvas.stage_frame(KittyFrame {
+            upload: "UPLOAD".into(),
+            camera,
+            margin: (20, 20),
+        });
         canvas.stage_view(camera, scale, area, cell);
         let mut output = Vec::new();
         canvas.flush(&mut output).unwrap();
@@ -566,7 +575,11 @@ mod tests {
         assert!(first.starts_with("UPLOAD"));
         assert!(first.contains("a=p,i=") && first.contains("x=20,y=20,w=64,h=128,C=1,z=-2"));
         // Camera half a unit right: content shifts 10 device px left.
-        let panned = Camera { x: 0.5, y: -0.25, ..camera };
+        let panned = Camera {
+            x: 0.5,
+            y: -0.25,
+            ..camera
+        };
         canvas.stage_view(panned, scale, area, cell);
         let mut output = Vec::new();
         canvas.flush(&mut output).unwrap();
@@ -579,8 +592,22 @@ mod tests {
         canvas.flush(&mut output).unwrap();
         assert!(output.is_empty());
         // Beyond the margin the crop clamps; a zoom change keeps it centred.
-        assert_eq!(crop_origin(camera, Camera { x: -100., ..camera }, (20, 20), scale), (0, 20));
-        assert_eq!(crop_origin(camera, Camera { zoom: 12., ..camera }, (20, 20), scale), (20, 20));
+        assert_eq!(
+            crop_origin(camera, Camera { x: -100., ..camera }, (20, 20), scale),
+            (0, 20)
+        );
+        assert_eq!(
+            crop_origin(
+                camera,
+                Camera {
+                    zoom: 12.,
+                    ..camera
+                },
+                (20, 20),
+                scale
+            ),
+            (20, 20)
+        );
     }
     #[test]
     fn shared_memory_frames_hold_straight_alpha_pixels() {
@@ -594,7 +621,14 @@ mod tests {
         unsafe {
             let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
             assert!(fd >= 0);
-            let map = libc::mmap(std::ptr::null_mut(), 24, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
+            let map = libc::mmap(
+                std::ptr::null_mut(),
+                24,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
             assert_ne!(map, libc::MAP_FAILED);
             let bytes = std::slice::from_raw_parts(map.cast::<u8>(), 24);
             assert_eq!(&bytes[..4], &[100, 50, 0, 128]);
@@ -651,8 +685,15 @@ mod tests {
                 vertical: Pixmap::new(2, h).unwrap(),
             })
         };
-        let rect = MarqueeRect { left: 12, top: 40, width: 100, height: 50 };
-        canvas.stage_marquee(Some(rect), area, cell, sprites).unwrap();
+        let rect = MarqueeRect {
+            left: 12,
+            top: 40,
+            width: 100,
+            height: 50,
+        };
+        canvas
+            .stage_marquee(Some(rect), area, cell, sprites)
+            .unwrap();
         let mut output = Vec::new();
         canvas.flush(&mut output).unwrap();
         let first = String::from_utf8(output).unwrap();
@@ -660,10 +701,17 @@ mod tests {
         assert!(first.contains("s=640,v=384"));
         for rect in [
             MarqueeRect { width: 300, ..rect },
-            MarqueeRect { left: 0, top: 0, width: 1, height: 1 },
+            MarqueeRect {
+                left: 0,
+                top: 0,
+                width: 1,
+                height: 1,
+            },
         ] {
             canvas
-                .stage_marquee(Some(rect), area, cell, |_, _| panic!("drag must not upload"))
+                .stage_marquee(Some(rect), area, cell, |_, _| {
+                    panic!("drag must not upload")
+                })
                 .unwrap();
             let mut output = Vec::new();
             canvas.flush(&mut output).unwrap();
@@ -672,12 +720,32 @@ mod tests {
             assert!(sequence.len() < 800);
         }
         let mut output = Vec::new();
-        canvas.stage_marquee(Some(MarqueeRect { left: 0, top: 0, width: 1, height: 1 }), area, cell, |_, _| panic!()).unwrap();
+        canvas
+            .stage_marquee(
+                Some(MarqueeRect {
+                    left: 0,
+                    top: 0,
+                    width: 1,
+                    height: 1,
+                }),
+                area,
+                cell,
+                |_, _| panic!(),
+            )
+            .unwrap();
         canvas.flush(&mut output).unwrap();
         assert!(output.is_empty());
-        canvas.stage_marquee(None, area, cell, |_, _| panic!()).unwrap();
+        canvas
+            .stage_marquee(None, area, cell, |_, _| panic!())
+            .unwrap();
         canvas.flush(&mut output).unwrap();
-        assert_eq!(String::from_utf8(output).unwrap().matches("a=d,d=i").count(), 3);
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("a=d,d=i")
+                .count(),
+            3
+        );
     }
     #[test]
     fn hover_moves_without_rasterizing_or_uploading_pixels_and_clips_to_canvas() {

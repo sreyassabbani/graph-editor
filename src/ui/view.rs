@@ -58,14 +58,24 @@ impl App {
         let mut buttons = Vec::new();
         let mut col = 0;
         for (text, action, enabled) in items {
-            buttons.push(Button { start: col, text, action, enabled });
+            buttons.push(Button {
+                start: col,
+                text,
+                action,
+                enabled,
+            });
             col += text.len();
         }
         let zoom = [(" - ", Zoom(1. / 1.2)), (" + ", Zoom(1.2))];
         let zoom_width: usize = zoom.iter().map(|(text, _)| text.len()).sum();
         col = (width as usize).saturating_sub(zoom_width).max(col);
         for (text, action) in zoom {
-            buttons.push(Button { start: col, text, action, enabled: true });
+            buttons.push(Button {
+                start: col,
+                text,
+                action,
+                enabled: true,
+            });
             col += text.len();
         }
         buttons
@@ -258,9 +268,9 @@ impl App {
                         spans.push(Span::raw(" ".repeat(gap)));
                     }
                 }
-                let hovered = self.toolbar_hover.is_some_and(|c| {
-                    (b.start..b.start + b.text.len()).contains(&(c as usize))
-                });
+                let hovered = self
+                    .toolbar_hover
+                    .is_some_and(|c| (b.start..b.start + b.text.len()).contains(&(c as usize)));
                 let style = match (b.enabled, hovered) {
                     (false, _) => Style::default().fg(Color::DarkGray),
                     (true, true) => Style::default().fg(Color::Black).bg(Color::Blue),
@@ -364,12 +374,22 @@ mod tests {
         let mut app = crate::ui::test_support::app();
         app.area = Rect::new(0, 1, 80, 23);
         let shown = |app: &App| -> Vec<(ToolbarAction, bool)> {
-            app.toolbar_buttons(80).iter().map(|b| (b.action, b.enabled)).collect()
+            app.toolbar_buttons(80)
+                .iter()
+                .map(|b| (b.action, b.enabled))
+                .collect()
         };
         // One vertex labeled "1", nothing selected, no history.
         assert_eq!(
             shown(&app),
-            [(Copy, true), (Undo, false), (Redo, false), (Fit, true), (Zoom(1. / 1.2), true), (Zoom(1.2), true)]
+            [
+                (Copy, true),
+                (Undo, false),
+                (Redo, false),
+                (Fit, true),
+                (Zoom(1. / 1.2), true),
+                (Zoom(1.2), true)
+            ]
         );
         assert_eq!(app.toolbar_action(7, 0), None, "disabled Undo is inert");
         assert_eq!(app.toolbar_action(79, 0), Some(Zoom(1.2)));
@@ -391,7 +411,9 @@ mod tests {
         assert!(actions.contains(&Label) && actions.contains(&Style) && actions.contains(&Delete));
         // Narrow terminals: zoom follows the menu rather than overlapping it.
         let narrow = app.toolbar_buttons(10);
-        assert!(narrow.windows(2).all(|w| w[0].start + w[0].text.len() <= w[1].start));
+        assert!(narrow
+            .windows(2)
+            .all(|w| w[0].start + w[0].text.len() <= w[1].start));
         // Rendered row: menu on the left, zoom flush right.
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut app = crate::ui::test_support::app();

@@ -15,7 +15,8 @@ impl App {
     }
     /// "5 vertices, 7 edges", "1 vertex".
     fn graph_summary(&self) -> String {
-        let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let vertices = plural(self.graph.vertices.len(), "vertex", "vertices");
         match self.graph.edges.len() {
             0 => vertices,

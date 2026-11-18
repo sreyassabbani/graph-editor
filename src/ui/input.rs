@@ -168,8 +168,13 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     {
                         let (w, h) = self.size();
-                        self.camera
-                            .zoom_at(if up { ZOOM_STEP } else { 1. / ZOOM_STEP }, p.0, p.1, w, h);
+                        self.camera.zoom_at(
+                            if up { ZOOM_STEP } else { 1. / ZOOM_STEP },
+                            p.0,
+                            p.1,
+                            w,
+                            h,
+                        );
                     } else {
                         let step = SCROLL_STEP / self.camera.zoom;
                         let step = if up { step } else { -step };
@@ -344,7 +349,9 @@ impl App {
             && !self.graph.vertices.iter().any(|v| v.x == x && v.y == y)
         {
             self.history.checkpoint(&self.graph);
-            let id = self.graph.add_styled_vertex(x, y, self.new_style, !self.new_unlabeled);
+            let id = self
+                .graph
+                .add_styled_vertex(x, y, self.new_style, !self.new_unlabeled);
             self.selection = Selection::vertex(id);
         }
     }
@@ -772,7 +779,12 @@ mod tests {
         let d = app.selection.vertices[0];
         assert_eq!(app.graph.vertex(d).unwrap().label, "");
         app.key(KeyCode::Char('R'), KeyModifiers::SHIFT);
-        let labels: Vec<_> = app.graph.vertices.iter().map(|v| v.label.as_str()).collect();
+        let labels: Vec<_> = app
+            .graph
+            .vertices
+            .iter()
+            .map(|v| v.label.as_str())
+            .collect();
         assert_eq!(labels, ["1", "2", "3"]);
         assert!(!app.new_unlabeled);
         app.add_vertex_at((300., 10.));
@@ -1001,7 +1013,11 @@ mod tests {
         click(&mut app, 52, 12);
         assert!(app.editing.is_none());
         assert_eq!(app.graph.vertices[0].label, "1x");
-        assert_eq!(app.graph.vertices.len(), 2, "the click also placed a vertex");
+        assert_eq!(
+            app.graph.vertices.len(),
+            2,
+            "the click also placed a vertex"
+        );
     }
     #[test]
     fn arrows_nudge_selection_one_unit_or_pan() {
