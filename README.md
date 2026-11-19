@@ -4,7 +4,7 @@ Draw a graph with the mouse in your terminal, then paste it into
 [Typst](https://typst.app) as a [Fletcher](https://typst.app/universe/package/fletcher)
 figure that looks the same as on screen.
 
-<img src="docs/demo.gif" width="900" alt="Drawing a four-vertex graph in the terminal, copying it, pasting it into a Typst file, and the PDF updating">
+<img src="docs/demo.gif" width="900" alt="Drawing a five-vertex graph with the pen in the terminal, giving it circled vertices, copying it, pasting it into a Typst file, and the PDF updating">
 
 ```sh
 nix run github:sreyassabbani/petersen
