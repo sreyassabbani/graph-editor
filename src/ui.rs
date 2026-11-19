@@ -188,10 +188,13 @@ struct CanvasState {
 enum Layer {
     #[default]
     All,
-    /// Everything except these vertices and their edges.
-    Still(Vec<u64>),
-    /// Only these vertices, their labels and their edges.
-    Moving(Vec<u64>),
+    /// Everything except these vertices and their edges, and except these
+    /// other edges, which cross a moving circle or plain label (an overlay
+    /// cannot erase the frame's pixels under it).
+    Still(Vec<u64>, Vec<Edge>),
+    /// Only these vertices, their labels and their edges, and these other
+    /// edges.
+    Moving(Vec<u64>, Vec<Edge>),
     /// Only the marks drawn over a Kitty frame: selection highlights, the
     /// edge-start ring and the hovered edge. Clicks that only change these
     /// redraw a few tiles instead of the canvas.
@@ -205,16 +208,24 @@ impl Layer {
     fn shows_vertex(&self, id: u64) -> bool {
         match self {
             Layer::All => true,
-            Layer::Still(ids) => !ids.contains(&id),
-            Layer::Moving(ids) => ids.contains(&id),
+            Layer::Still(ids, _) => !ids.contains(&id),
+            Layer::Moving(ids, _) => ids.contains(&id),
             Layer::Decor | Layer::Pen => false,
         }
+    }
+    fn cut(cuts: &[Edge], a: u64, b: u64) -> bool {
+        cuts.iter()
+            .any(|e| (e.a, e.b) == (a, b) || (e.a, e.b) == (b, a))
     }
     fn shows_edge(&self, a: u64, b: u64) -> bool {
         match self {
             Layer::All => true,
-            Layer::Still(ids) => !ids.contains(&a) && !ids.contains(&b),
-            Layer::Moving(ids) => ids.contains(&a) || ids.contains(&b),
+            Layer::Still(ids, cuts) => {
+                !ids.contains(&a) && !ids.contains(&b) && !Self::cut(cuts, a, b)
+            }
+            Layer::Moving(ids, cuts) => {
+                ids.contains(&a) || ids.contains(&b) || Self::cut(cuts, a, b)
+            }
             Layer::Decor | Layer::Pen => false,
         }
     }
@@ -239,6 +250,8 @@ struct App {
     /// generation of the edge it drew, if any (so a double-click can take
     /// that edge back).
     last_click: Option<(u64, Instant, Option<u64>)>,
+    /// The camera a left-button gesture hit-tests against, fixed at its press.
+    gesture_camera: Option<Camera>,
     /// The pen's ring unrolling into the edge it just drew: from, to, start.
     unroll: Option<(u64, u64, Instant)>,
     /// The pen ring's turn in dashes (0..1), how far it has spun up (0..1),
@@ -380,6 +393,7 @@ impl App {
             hover_edge: None,
             drag: None,
             last_click: None,
+            gesture_camera: None,
             unroll: None,
             spin_pos: 0.,
             spin_ramp: 0.,

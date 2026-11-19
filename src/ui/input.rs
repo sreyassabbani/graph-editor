@@ -9,8 +9,8 @@ const ZOOM_STEP: f64 = 1.08;
 impl App {
     pub(super) fn size(&self) -> (f64, f64) {
         (
-            self.area.width as f64 * self.cell.0 as f64,
-            self.area.height as f64 * self.cell.1 as f64,
+            f64::from(self.area.width) * self.cell.0,
+            f64::from(self.area.height) * self.cell.1,
         )
     }
     pub(super) fn local(&self, col: u16, row: u16) -> Option<(f64, f64)> {
@@ -22,8 +22,8 @@ impl App {
             return None;
         }
         Some((
-            (col - self.area.x) as f64 * self.cell.0 as f64 + self.cell.0 as f64 / 2.,
-            (row - self.area.y) as f64 * self.cell.1 as f64 + self.cell.1 as f64 / 2.,
+            f64::from(col - self.area.x) * self.cell.0 + self.cell.0 / 2.,
+            f64::from(row - self.area.y) * self.cell.1 + self.cell.1 / 2.,
         ))
     }
     pub(super) fn world(&self, p: (f64, f64)) -> (f64, f64) {
@@ -169,13 +169,20 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(p) = p {
                     self.status.clear();
-                    self.on_displayed_camera(|app| app.left_down(p, m.modifiers));
+                    // The whole gesture hit-tests against what the press saw,
+                    // even if a new frame arrives before the release.
+                    let shown = self.displayed_camera();
+                    self.gesture_camera = Some(shown);
+                    self.on_camera(shown, |app| app.left_down(p, m.modifiers));
                 }
             }
             MouseEventKind::Drag(button) => {
                 if let Some(p) = p {
                     if button == MouseButton::Left {
-                        self.on_displayed_camera(|app| app.left_drag(p));
+                        let shown = self
+                            .gesture_camera
+                            .unwrap_or_else(|| self.displayed_camera());
+                        self.on_camera(shown, |app| app.left_drag(p));
                     } else if let Some(Drag::Pan(x, y)) = &mut self.drag {
                         self.camera.x -= (p.0 - *x) / self.camera.zoom;
                         self.camera.y += (p.1 - *y) / self.camera.zoom;
@@ -188,12 +195,18 @@ impl App {
                 // A different button's release must not finish the active gesture.
                 match (&self.drag, button) {
                     (Some(Drag::Vertices { .. } | Drag::Marquee { .. }), MouseButton::Left) => {
-                        self.on_displayed_camera(|app| app.left_up(p))
+                        let shown = self
+                            .gesture_camera
+                            .unwrap_or_else(|| self.displayed_camera());
+                        self.on_camera(shown, |app| app.left_up(p));
                     }
                     (Some(Drag::Pan(..)), MouseButton::Middle | MouseButton::Right) => {
                         self.drag = None
                     }
                     _ => {}
+                }
+                if button == MouseButton::Left {
+                    self.gesture_camera = None;
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -234,7 +247,10 @@ impl App {
     /// act on what is visible. Only hit-testing sees it: the handlers do not
     /// move the camera, and the real one is restored afterwards.
     fn on_displayed_camera(&mut self, handle: impl FnOnce(&mut Self)) {
-        let shown = self.displayed_camera();
+        self.on_camera(self.displayed_camera(), handle);
+    }
+    /// Run `handle` with `shown` standing in for the camera.
+    fn on_camera(&mut self, shown: Camera, handle: impl FnOnce(&mut Self)) {
         if shown == self.camera {
             return handle(self);
         }
@@ -856,10 +872,8 @@ impl App {
             self.selection = Selection::default();
             return false;
         }
-        if code != KeyCode::Char('q') {
-            if std::mem::take(&mut self.quit_pending) {
-                self.status.clear();
-            }
+        if code != KeyCode::Char('q') && std::mem::take(&mut self.quit_pending) {
+            self.status.clear();
         }
         match (code, mods) {
             (KeyCode::Char('q'), _) => {
@@ -1556,6 +1570,7 @@ mod tests {
                 camera: shown,
                 margin: (0, 0),
                 omits: Vec::new(),
+                cuts: Vec::new(),
                 hides: None,
             });
             canvas.stage_view(shown, scale, area, cell);
@@ -1576,6 +1591,51 @@ mod tests {
         let plus = app.toolbar_buttons(80).last().unwrap().start as u16 + 1;
         click(&mut app, plus, 0);
         assert!(app.camera.zoom > zoom, "the zoom click must not be lost");
+    }
+    #[test]
+    fn a_click_keeps_the_view_its_press_saw_when_a_frame_lands_between() {
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut app = App::new(Graph::default(), picker);
+        app.graph.add_vertex(3., 2.);
+        app.area = Rect::new(0, 1, 80, 23);
+        let shown = app.camera;
+        let (scale, area, cell) = (app.device_scale(), app.area, app.picker.font_size());
+        let frame = |camera| graphics::KittyFrame {
+            upload: String::new(),
+            camera,
+            margin: (0, 0),
+            omits: Vec::new(),
+            cuts: Vec::new(),
+            hides: None,
+        };
+        if let Some(canvas) = &mut app.kitty {
+            canvas.stage_frame(frame(shown));
+            canvas.stage_view(shown, scale, area, cell);
+        }
+        app.camera.zoom *= 3.;
+        let (w, h) = app.size();
+        let on_screen = shown.world_to_screen(3., 2., w, h);
+        let (col, row) = (
+            (on_screen.0 / app.cell.0) as u16,
+            (on_screen.1 / app.cell.1) as u16 + 1,
+        );
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        // The zoomed frame arrives between press and release; at that zoom
+        // the pointer is no longer over vertex 1.
+        let zoomed = app.camera;
+        if let Some(canvas) = &mut app.kitty {
+            canvas.stage_frame(frame(zoomed));
+            canvas.stage_view(zoomed, scale, area, cell);
+        }
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), col, row);
+        assert_eq!(
+            app.edge_start,
+            Some(1),
+            "the click lands where it was pressed"
+        );
+        assert_eq!(app.graph.vertices.len(), 1);
+        assert!(app.gesture_camera.is_none());
     }
 
     #[test]

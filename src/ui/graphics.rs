@@ -54,9 +54,12 @@ pub(super) const TILE: u32 = 64;
 
 /// The first and last tile id of this process for tile set `set`: dragged
 /// layer (0), decorations (1) or the pen (2). One image per tile position.
+/// Each holds 13 bits of the process id, so two editors in one terminal
+/// share a range only if their ids agree in those bits, and 15 bits of tile
+/// position (see [`TileSet::id`]).
 fn tile_ids(set: u32) -> (u32, u32) {
-    let base = (0x5000_0000 + set * 0x1000_0000) | ((std::process::id() & 0xff) << 20);
-    (base, base + 0x000f_ffff)
+    let base = (0x5000_0000 + set * 0x1000_0000) | ((std::process::id() & 0x1fff) << 15);
+    (base, base + 0x7fff)
 }
 
 /// Tiles of one layer now shown, by (column, row), with a hash of their
@@ -72,7 +75,7 @@ struct TileSet {
 
 impl TileSet {
     fn id(&self, (col, row): (u32, u32)) -> u32 {
-        tile_ids(self.set).0 + (row << 12) + col
+        tile_ids(self.set).0 + (row << 8) + col
     }
     /// Show `layer` (pixels and their canvas origin, both aligned to
     /// [`TILE`]). Only tiles whose pixels changed are sent; empty ones are
@@ -108,9 +111,9 @@ impl TileSet {
                     let hash = hasher.finish();
                     let (x, y) = (origin.0 + left, origin.1 + top);
                     let key = (x / TILE, y / TILE);
-                    // Ids hold 12 bits of column and 8 of row (a canvas of
-                    // 262144 x 16384 px); never spill into another range.
-                    if key.0 >= 1 << 12 || key.1 >= 1 << 8 {
+                    // Ids hold 8 bits of column and 7 of row (a canvas of
+                    // 16384 x 8192 px); never spill into another range.
+                    if key.0 >= 1 << 8 || key.1 >= 1 << 7 {
                         continue;
                     }
                     shown.insert(key, hash);
@@ -192,12 +195,15 @@ pub(super) struct KittyCanvas {
     frame: Option<(crate::core::Camera, (u32, u32))>,
     /// Crop origin and area of the canvas placement now shown.
     view: Option<((u32, u32), Rect)>,
+    /// The pane area and cell size the uploaded frame was first placed in.
+    frame_fits: Option<(Rect, (u16, u16))>,
     /// Canvas size and strip thicknesses of the uploaded marquee sprites.
     marquee_sprites: Option<((u32, u32), (u32, u32))>,
     marquee_placement: Option<(MarqueeRect, Rect, (u16, u16))>,
     /// Vertices the shown frame leaves out (dragged or relabeled), which the
     /// moving tiles then draw.
     frame_omits: Vec<u64>,
+    frame_cuts: Vec<crate::core::Edge>,
     /// An edge the shown frame leaves out while it is animated in.
     frame_hides: Option<crate::core::Edge>,
     tiles: TileSet,
@@ -283,7 +289,9 @@ impl KittyCanvas {
             marquee_placement: None,
             frame: None,
             view: None,
+            frame_fits: None,
             frame_omits: Vec::new(),
+            frame_cuts: Vec::new(),
             frame_hides: None,
             tiles: TileSet {
                 z: -1,
@@ -303,6 +311,9 @@ impl KittyCanvas {
     }
     pub(super) fn frame_omits(&self) -> &[u64] {
         &self.frame_omits
+    }
+    pub(super) fn frame_cuts(&self) -> &[crate::core::Edge] {
+        &self.frame_cuts
     }
     pub(super) fn frame_hides(&self) -> Option<crate::core::Edge> {
         self.frame_hides
@@ -352,9 +363,11 @@ impl KittyCanvas {
     pub(super) fn stage_frame(&mut self, frame: KittyFrame) {
         self.pending.push_str(&frame.upload);
         self.frame_omits = frame.omits;
+        self.frame_cuts = frame.cuts;
         self.frame_hides = frame.hides;
         self.frame = Some((frame.camera, frame.margin));
         self.view = None;
+        self.frame_fits = None;
     }
     /// Show the canvas for `camera`. A pan within the frame's margin only moves
     /// the crop window: a ~150 byte command instead of a new frame. `scale` is
@@ -369,6 +382,18 @@ impl KittyCanvas {
         let Some((rendered, margin)) = self.frame else {
             return;
         };
+        // After a resize the old frame no longer fits the pane: take it down
+        // until the frame rendered for the new size arrives, rather than
+        // showing it cropped or offset.
+        if *self.frame_fits.get_or_insert((area, cell)) != (area, cell) {
+            if self.view.take().is_some() {
+                self.pending.push_str(&passthrough(
+                    &format!("\x1b_Ga=d,d=i,i={},p=1,q=2\x1b\\", image_id()),
+                    is_tmux(),
+                ));
+            }
+            return;
+        }
         let source = crop_origin(rendered, camera, margin, scale);
         if self.view == Some((source, area)) {
             return;
@@ -508,6 +533,7 @@ impl KittyCanvas {
         self.decor.forget();
         self.pen.forget();
         self.frame_omits.clear();
+        self.frame_cuts.clear();
         self.frame_hides = None;
         self.hover_size = None;
         self.hover_placement = None;
@@ -515,6 +541,7 @@ impl KittyCanvas {
         self.marquee_placement = None;
         self.frame = None;
         self.view = None;
+        self.frame_fits = None;
     }
     pub(super) fn flush(&mut self, output: &mut impl Write) -> io::Result<()> {
         if !self.pending.is_empty() {
@@ -542,7 +569,7 @@ fn unpremultiply_into(src: &[u8], dst: &mut [u8]) {
     const BLOCK: usize = 64;
     let partial = |p: &[u8]| ((u16::from(p[3]) + 1) & 0xfe) != 0;
     let convert = |s: &[u8], d: &mut [u8]| {
-        for (s, d) in s.chunks_exact(4).zip(d.chunks_exact_mut(4)) {
+        for (s, d) in s.as_chunks::<4>().0.iter().zip(d.as_chunks_mut::<4>().0) {
             let a = u16::from(s[3]);
             if partial(s) {
                 for k in 0..3 {
@@ -550,15 +577,21 @@ fn unpremultiply_into(src: &[u8], dst: &mut [u8]) {
                 }
                 d[3] = s[3];
             } else {
-                d.copy_from_slice(s);
+                *d = *s;
             }
         }
     };
-    let mut blocks = src.chunks_exact(BLOCK).zip(dst.chunks_exact_mut(BLOCK));
-    for (s, d) in &mut blocks {
+    let blocks = src
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<BLOCK>().0);
+    for (s, d) in blocks {
         // (a + 1) & 0xfe is zero exactly for a = 0 and a = 255.
         let any = s
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .fold(0u16, |acc, p| acc | ((u16::from(p[3]) + 1) & 0xfe));
         if any == 0 {
             d.copy_from_slice(s);
@@ -589,6 +622,8 @@ pub(super) struct KittyFrame {
     pub margin: (u32, u32),
     /// Vertices it leaves out (see `Layer::Still`); empty for a full frame.
     pub omits: Vec<u64>,
+    /// Other edges it leaves out, which cross a moving mark.
+    pub cuts: Vec<crate::core::Edge>,
     /// An edge it leaves out while the pen animates it in.
     pub hides: Option<crate::core::Edge>,
 }
@@ -723,6 +758,51 @@ fn upload(png: &[u8], header: &str, tmux: bool) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn a_resized_pane_takes_the_old_frame_down_until_a_new_one_fits() {
+        let camera = crate::core::Camera {
+            x: 0.,
+            y: 0.,
+            zoom: 10.,
+        };
+        let (scale, cell) = ((2., 2.), (16, 32));
+        let mut canvas = KittyCanvas::new();
+        canvas.stage_frame(KittyFrame {
+            upload: String::new(),
+            camera,
+            margin: (0, 0),
+            omits: Vec::new(),
+            cuts: Vec::new(),
+            hides: None,
+        });
+        canvas.stage_view(camera, scale, Rect::new(0, 1, 80, 20), cell);
+        assert!(canvas.shown_camera(scale).is_some());
+        canvas.pending.clear();
+        canvas.stage_view(camera, scale, Rect::new(0, 1, 100, 30), cell);
+        assert!(
+            canvas.pending.contains("a=d,d=i"),
+            "the old placement is removed"
+        );
+        assert!(canvas.shown_camera(scale).is_none());
+        // Back to the size it was drawn for, it shows again.
+        canvas.stage_view(camera, scale, Rect::new(0, 1, 80, 20), cell);
+        assert!(canvas.shown_camera(scale).is_some());
+    }
+    #[test]
+    fn tile_id_ranges_stay_apart_and_hold_every_tile() {
+        let ranges: Vec<_> = (0..3).map(tile_ids).collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(a.1 < b.0 || b.1 < a.0);
+            }
+            assert!(a.0 > hover_id() && a.0 > marquee_ids()[2]);
+            let set = TileSet {
+                set: i as u32,
+                ..TileSet::default()
+            };
+            assert_eq!(set.id(((1 << 8) - 1, (1 << 7) - 1)), a.1);
+        }
+    }
+    #[test]
     fn frames_upload_without_placing_and_pans_only_move_the_crop() {
         use crate::core::Camera;
         let mut pix = Pixmap::new(80, 160).unwrap();
@@ -757,6 +837,7 @@ mod tests {
             camera,
             margin: (20, 20),
             omits: Vec::new(),
+            cuts: Vec::new(),
             hides: None,
         });
         canvas.stage_view(camera, scale, area, cell);
@@ -837,7 +918,7 @@ mod tests {
             *p = resvg::tiny_skia::PremultipliedColorU8::from_rgba(a / 3, a / 2, a, a).unwrap();
         }
         let ours = unpremultiply(pix.clone());
-        for (p, mine) in pix.pixels().iter().zip(ours.chunks_exact(4)) {
+        for (p, mine) in pix.pixels().iter().zip(ours.as_chunks::<4>().0) {
             // tiny-skia rounds exact .5 ties inconsistently (float math).
             let c = p.demultiply();
             let theirs = [c.red(), c.green(), c.blue(), c.alpha()];

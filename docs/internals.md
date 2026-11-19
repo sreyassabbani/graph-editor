@@ -35,7 +35,13 @@ moving (or their label is being typed), the frame is redrawn once without
 them and their edges. That part is drawn into 64 px tiles over it, and each
 pointer move or keystroke resends only the tiles whose pixels changed, so a
 step costs tens of kilobytes instead of a full frame. Releasing (or saving
-the label) renders one full frame, which replaces the tiles.
+the label) renders one full frame, which replaces the tiles. A tile can't
+erase the frame's pixels under it, so an unrelated edge crossing a moving
+circle or plain label is left out of that frame too and drawn, clipped, with
+the tiles; the frame is redrawn only when the set of crossed edges changes.
+The tiles draw only what the frame on screen leaves out, so a group that
+starts moving while an older partial frame is up waits a frame rather than
+showing twice.
 
 **Decorations.** On Kitty the frame never shows selection, the pen ring or
 the hovered edge. Selection and the hovered edge are a second tile set (`Layer::Decor`) drawn over it

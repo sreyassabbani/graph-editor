@@ -165,7 +165,11 @@ impl App {
         // the still part and stays the same while the pointer moves or keys
         // are typed; `moving_scene` draws the rest as tiles.
         let (mut graph, layer) = match self.moving() {
-            Some((ids, still)) if kitty => (still, Layer::Still(ids)),
+            Some((ids, still)) if kitty => {
+                let cuts =
+                    canvas::cut_edges(&self.preview_graph(), &ids, self.camera, self.size(), scale);
+                (still, Layer::Still(ids, cuts))
+            }
             _ => (self.preview_graph(), Layer::All),
         };
         // An edge the pen is unrolling into is drawn by the pen layer until
@@ -251,28 +255,27 @@ impl App {
         }
     }
 
-    /// Every vertex the shown Kitty frame leaves out, drawn where it is now,
-    /// with its edges: those being dragged or relabeled, and any an older
-    /// partial frame still on screen omits (until the full frame arrives).
+    /// Everything the shown Kitty frame leaves out, drawn where it is now:
+    /// the vertices being dragged or relabeled with their edges, and other
+    /// edges crossing their marks. Tiles stay until a full frame arrives.
     fn moving_scene(&self) -> Option<canvas::Scene> {
-        let omitted = self.kitty.as_ref()?.frame_omits();
-        if omitted.is_empty() {
+        let canvas = self.kitty.as_ref()?;
+        if canvas.frame_omits().is_empty() {
             return None;
         }
-        let mut ids = omitted.to_vec();
-        for id in self.moving().map(|(ids, _)| ids).unwrap_or_default() {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        let mut scene = self.overlay_scene(self.preview_graph(), Layer::Moving(ids));
+        // Only what the shown frame leaves out: a group that starts moving
+        // while an older partial frame is up waits for its own, as the first
+        // drag does, instead of showing twice.
+        let layer = Layer::Moving(canvas.frame_omits().to_vec(), canvas.frame_cuts().to_vec());
+        let mut scene = self.overlay_scene(self.preview_graph(), layer);
         scene.state.camera = self.displayed_camera();
         Some(scene)
     }
 
-    /// Selection highlights and the hovered edge, drawn over the shown frame with its camera so they line up even while a new zoom
-    /// renders. `None` when there are none, without a frame, or while moving
-    /// tiles are up (they carry the selection's colors themselves).
+    /// Selection highlights and the hovered edge, drawn over the shown frame
+    /// with its camera so they line up even while a new zoom renders. `None`
+    /// when there are none, without a frame, or while moving tiles are up
+    /// (they carry the selection's colors themselves).
     fn decor_scene(&self) -> Option<canvas::Scene> {
         let canvas = self.kitty.as_ref()?;
         if !canvas.frame_omits().is_empty() || canvas.shown_camera(self.device_scale()).is_none() {
@@ -784,7 +787,7 @@ mod tests {
         app.selection = Selection::vertex(1);
         app.edit_label();
         let frame = app.scene().state;
-        assert_eq!(frame.layer, Layer::Still(vec![1]));
+        assert_eq!(frame.layer, Layer::Still(vec![1], Vec::new()));
         app.key(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(app.scene().state == frame, "keystrokes keep the frame");
         // Once that frame is up, tiles draw the typed label.
@@ -800,6 +803,7 @@ mod tests {
                 camera,
                 margin: (0, 0),
                 omits: vec![1],
+                cuts: Vec::new(),
                 hides: None,
             });
             canvas.stage_view(camera, scale, area, cell);
@@ -832,6 +836,7 @@ mod tests {
                 camera,
                 margin: (0, 0),
                 omits: Vec::new(),
+                cuts: Vec::new(),
                 hides: None,
             });
             canvas.stage_view(camera, scale, area, cell);
@@ -881,11 +886,111 @@ mod tests {
                 camera,
                 margin: (0, 0),
                 omits: Vec::new(),
+                cuts: Vec::new(),
                 hides: None,
             });
             canvas.stage_view(camera, scale, area, cell);
         }
         app
+    }
+    #[test]
+    fn a_dragged_label_cuts_edges_it_crosses_out_of_the_still_frame() {
+        let mut graph = Graph::default();
+        let a = graph.add_vertex(-2., 0.);
+        let b = graph.add_vertex(2., 0.);
+        graph.connect(a, b);
+        let label = graph.add_vertex(0., 3.);
+        let mut app = kitty_with_frame(graph);
+        let v = app.graph.vertex_mut(label).unwrap();
+        v.style = VertexStyle::Plain;
+        v.label = "long label".into();
+        let edge = app.graph.edges[0];
+        // Typing in place, away from the edge: nothing to cut.
+        app.selection = Selection::vertex(label);
+        app.edit_label();
+        assert_eq!(
+            app.scene().state.layer,
+            Layer::Still(vec![label], Vec::new())
+        );
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        // Dragged onto the edge, the frame leaves the edge to the tiles.
+        let original = app.graph.clone();
+        app.graph.vertex_mut(label).unwrap().y = 0.;
+        app.drag = Some(Drag::Vertices {
+            anchor: label,
+            ids: vec![label],
+            original,
+            offset: (0., 0.),
+            moved: true,
+            narrow: false,
+            grab: Grab::Vertex,
+        });
+        let still = app.scene().state;
+        assert_eq!(still.layer, Layer::Still(vec![label], vec![edge]));
+        assert_eq!(
+            still.graph.edges.len(),
+            1,
+            "the still graph keeps it; the layer skips it"
+        );
+        // Once that frame is up, the tiles draw the label and the cut edge.
+        let (camera, scale, area, cell) = (
+            app.camera,
+            app.device_scale(),
+            app.area,
+            app.picker.font_size(),
+        );
+        if let Some(canvas) = &mut app.kitty {
+            canvas.stage_frame(graphics::KittyFrame {
+                upload: String::new(),
+                camera,
+                margin: (0, 0),
+                omits: vec![label],
+                cuts: vec![edge],
+                hides: None,
+            });
+            canvas.stage_view(camera, scale, area, cell);
+        }
+        let tiles = app.moving_scene().unwrap().state;
+        assert_eq!(tiles.layer, Layer::Moving(vec![label], vec![edge]));
+    }
+    #[test]
+    fn a_second_group_moves_only_once_a_frame_leaves_it_out() {
+        let mut graph = Graph::default();
+        let first = graph.add_vertex(0., 0.);
+        let second = graph.add_vertex(3., 0.);
+        let mut app = kitty_with_frame(graph);
+        // The frame on screen still omits the first group, just released.
+        let (camera, scale, area, cell) = (
+            app.camera,
+            app.device_scale(),
+            app.area,
+            app.picker.font_size(),
+        );
+        if let Some(canvas) = &mut app.kitty {
+            canvas.stage_frame(graphics::KittyFrame {
+                upload: String::new(),
+                camera,
+                margin: (0, 0),
+                omits: vec![first],
+                cuts: Vec::new(),
+                hides: None,
+            });
+            canvas.stage_view(camera, scale, area, cell);
+        }
+        let original = app.graph.clone();
+        app.graph.vertex_mut(second).unwrap().x = 4.;
+        app.drag = Some(Drag::Vertices {
+            anchor: second,
+            ids: vec![second],
+            original,
+            offset: (0., 0.),
+            moved: true,
+            narrow: false,
+            grab: Grab::Vertex,
+        });
+        // That frame still draws the second group, so the tiles must not.
+        let tiles = app.moving_scene().unwrap().state;
+        assert_eq!(tiles.layer, Layer::Moving(vec![first], Vec::new()));
     }
     #[test]
     fn pen_ring_hugs_a_dot_instead_of_reaching_its_label() {
@@ -954,6 +1059,7 @@ mod tests {
                 camera,
                 margin: (0, 0),
                 omits: Vec::new(),
+                cuts: Vec::new(),
                 hides: Some(edge),
             });
             canvas.stage_view(camera, scale, area, cell);

@@ -162,6 +162,8 @@ pub(super) struct LabelSprite {
     bounds: Option<(f64, f64, f64, f64)>,
 }
 
+/// Label sprites to stamp over a scene, each with its center point.
+type Labels = Vec<(Rc<LabelSprite>, (f64, f64))>;
 type LabelKey = (String, u64, u64, u64, usize);
 thread_local! {
     static LABELS: RefCell<HashMap<LabelKey, Rc<LabelSprite>>> = RefCell::new(HashMap::new());
@@ -359,6 +361,55 @@ impl Hole {
         let (lo, hi) = (lo.max(0.), hi.min(1.));
         (lo < hi).then_some((lo, hi))
     }
+}
+
+/// Edges, other than those of `ids`, that cross the circle or plain label of
+/// a vertex in `ids` where `graph` has it. A frame drawn without `ids` shows
+/// them unbroken, and the moving tiles over it cannot erase that, so the
+/// frame leaves them to the tiles, which clip them as a full frame would.
+pub(super) fn cut_edges(
+    graph: &Graph,
+    ids: &[u64],
+    camera: Camera,
+    (w, h): (f64, f64),
+    scale: (f64, f64),
+) -> Vec<Edge> {
+    let Sizes { font, ring, .. } = sizes(camera.zoom);
+    let mut holes = Vec::new();
+    for v in graph.vertices.iter().filter(|v| ids.contains(&v.id)) {
+        let (x, y) = camera.world_to_screen(v.x, v.y, w, h);
+        match v.style {
+            VertexStyle::Circles => holes.push(Hole::Circle((x, y), ring)),
+            // As in `svg_scene`: a plain label is centered on its vertex.
+            VertexStyle::Plain => {
+                if let Some(b) = label_sprite(&v.label, font, scale, options()).bounds {
+                    holes.push(Hole::Rect(
+                        (x + b.0 - 3., y + b.1 - 3.),
+                        (x + b.2 + 3., y + b.3 + 3.),
+                    ));
+                }
+            }
+            VertexStyle::Dots => {}
+        }
+    }
+    if holes.is_empty() {
+        return Vec::new();
+    }
+    let at: HashMap<_, _> = graph
+        .vertices
+        .iter()
+        .map(|v| (v.id, camera.world_to_screen(v.x, v.y, w, h)))
+        .collect();
+    graph
+        .edges
+        .iter()
+        .filter(|e| !ids.contains(&e.a) && !ids.contains(&e.b))
+        .filter(|e| match (at.get(&e.a), at.get(&e.b)) {
+            (Some(p), Some(q)) => holes.iter().any(|hole| hole.interval(*p, *q).is_some()),
+            _ => false,
+        })
+        .copied()
+        .collect()
 }
 
 /// Visible parameter ranges of a segment after removing every hole.
@@ -561,7 +612,7 @@ impl Scene {
         let tree = usvg::Tree::from_str(&svg, fonts).context("parsing graph SVG")?;
         let mut pix = Pixmap::new(size.0, size.1).context("allocating canvas")?;
         // Tiles of the dragged layer float over a frame that has the grid.
-        if self.state.layer == Layer::All || matches!(self.state.layer, Layer::Still(_)) {
+        if self.state.layer == Layer::All || matches!(self.state.layer, Layer::Still(..)) {
             debug_assert_eq!(origin, (0, 0));
             self.draw_grid(&mut pix, w, h);
         }
@@ -600,7 +651,7 @@ impl Scene {
     /// `None` when nothing of it is on screen.
     pub(super) fn render_tiles(&self, tile: u32) -> Result<Option<(Pixmap, (u32, u32))>> {
         let ids: Vec<u64> = match &self.state.layer {
-            Layer::Moving(ids) => ids.clone(),
+            Layer::Moving(ids, _) => ids.clone(),
             Layer::Decor => self.state.selection.vertices.clone(),
             Layer::Pen => {
                 let mut ids: Vec<u64> = self.state.edge_start.into_iter().collect();
@@ -880,7 +931,7 @@ impl Scene {
         h: f64,
         scale: (f64, f64),
         fonts: &usvg::Options,
-    ) -> Result<(String, Vec<(Rc<LabelSprite>, (f64, f64))>)> {
+    ) -> Result<(String, Labels)> {
         let foreground = theme::color(theme::FOREGROUND);
         let accent = theme::color(theme::ACCENT);
         let state = &self.state;
@@ -924,7 +975,9 @@ impl Scene {
             // the circle of one that stays put cuts the dragged edges reaching
             // it. The still frame skips the moving ones' holes: a label being
             // retyped or dragged would leave a stale gap in an edge crossing it.
-            let clips = !matches!(layer, Layer::Still(_)) || layer.shows_vertex(v.id);
+            // Edges crossing where it is now are cut from the frame instead
+            // (`cut_edges`) and drawn, clipped, with the moving part.
+            let clips = !matches!(layer, Layer::Still(..)) || layer.shows_vertex(v.id);
             if clips && v.style == VertexStyle::Circles {
                 holes.push(Hole::Circle((x, y), ring));
             }
@@ -1048,7 +1101,7 @@ impl Scene {
             self.pen_marks(&mut scene, &rings, &holes, stroke);
         }
         // The draggable area of a multi-selection (not while it moves).
-        if !matches!(layer, Layer::Still(_) | Layer::Moving(_)) {
+        if !matches!(layer, Layer::Still(..) | Layer::Moving(..)) {
             if let Some((lo, hi)) =
                 selection_box(&state.graph, &state.selection, state.camera, w, h)
             {
@@ -1129,7 +1182,7 @@ mod tests {
         app.graph.connect(near, far);
         let mut scene = app.scene();
         let (width, height) = scene.state.size;
-        scene.state.layer = Layer::Moving(vec![near]);
+        scene.state.layer = Layer::Moving(vec![near], Vec::new());
         let full = scene.render().unwrap();
         let (tiles, (x0, y0)) = scene.render_tiles(16).unwrap().unwrap();
         assert!(tiles.width() < width, "tiles cover only the dragged part");
@@ -1155,7 +1208,7 @@ mod tests {
         assert!(drawn > 0);
         // The still layer leaves out the dragged vertex and both its edges,
         // keeping only the far vertex (and the grid).
-        scene.state.layer = Layer::Still(vec![near]);
+        scene.state.layer = Layer::Still(vec![near], Vec::new());
         let still = scene
             .svg_scene(
                 scene.logical_size.0,

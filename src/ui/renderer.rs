@@ -90,6 +90,41 @@ impl Renderer {
     }
 }
 
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        let mut mailbox = self.shared.0.lock().unwrap();
+        mailbox.stopped = true;
+        mailbox.next = None;
+        self.shared.1.notify_one();
+    }
+}
+
+fn render(job: &Job) -> Result<Frame> {
+    let pix = job.scene.render()?;
+    if let Some(transport) = job.kitty {
+        Ok(Frame::Kitty(graphics::KittyFrame {
+            upload: graphics::encode_frame(pix, transport, graphics::is_tmux())?,
+            camera: job.scene.state.camera,
+            margin: job.scene.margin,
+            omits: match &job.scene.state.layer {
+                Layer::Still(ids, _) => ids.clone(),
+                _ => Vec::new(),
+            },
+            cuts: match &job.scene.state.layer {
+                Layer::Still(_, cuts) => cuts.clone(),
+                _ => Vec::new(),
+            },
+            hides: job.scene.state.hide_edge,
+        }))
+    } else {
+        let (width, height) = (pix.width(), pix.height());
+        let rgba = graphics::unpremultiply(pix);
+        let image =
+            image::RgbaImage::from_raw(width, height, rgba).context("canvas pixel buffer")?;
+        Ok(Frame::Image(image.into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +143,7 @@ mod tests {
                 camera: job.scene.state.camera,
                 margin: (0, 0),
                 omits: Vec::new(),
+                cuts: Vec::new(),
                 hides: None,
             }))
         });
@@ -144,36 +180,5 @@ mod tests {
         let (_, frame) = renderer.take().unwrap();
         assert!(matches!(frame.unwrap(), Frame::Kitty(f) if f.upload == "3"));
         assert!(!renderer.busy());
-    }
-}
-
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        let mut mailbox = self.shared.0.lock().unwrap();
-        mailbox.stopped = true;
-        mailbox.next = None;
-        self.shared.1.notify_one();
-    }
-}
-
-fn render(job: &Job) -> Result<Frame> {
-    let pix = job.scene.render()?;
-    if let Some(transport) = job.kitty {
-        Ok(Frame::Kitty(graphics::KittyFrame {
-            upload: graphics::encode_frame(pix, transport, graphics::is_tmux())?,
-            camera: job.scene.state.camera,
-            margin: job.scene.margin,
-            omits: match &job.scene.state.layer {
-                Layer::Still(ids) => ids.clone(),
-                _ => Vec::new(),
-            },
-            hides: job.scene.state.hide_edge,
-        }))
-    } else {
-        let (width, height) = (pix.width(), pix.height());
-        let rgba = graphics::unpremultiply(pix);
-        let image =
-            image::RgbaImage::from_raw(width, height, rgba).context("canvas pixel buffer")?;
-        Ok(Frame::Image(image.into()))
     }
 }
